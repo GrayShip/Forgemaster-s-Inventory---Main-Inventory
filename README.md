@@ -18,8 +18,7 @@ Without engine changes a script cannot:
 Every change is a generic hook: the engine asks the player's scripts
 (genericScriptContexts in player.config) and behaves as before when no script
 answers. Without mods that use the hooks the game behaves like stock
-OpenStarbound. The network protocol is unchanged, so the build can play on
-regular OpenStarbound servers.
+OpenStarbound. The network protocol is unchanged.
 
 
 1. VIRTUAL INVENTORY
