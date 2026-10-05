@@ -1,0 +1,4585 @@
+diff --git a/source/frontend/StarActionBar.cpp b/source/frontend/StarActionBar.cpp
+index 6379870..39adfc4 100644
+--- a/source/frontend/StarActionBar.cpp
++++ b/source/frontend/StarActionBar.cpp
+@@ -321,6 +321,13 @@ void ActionBar::customBarClick(uint8_t index, bool primary) {
+ }
+ 
+ void ActionBar::customBarClickRight(uint8_t index, bool primary) {
++  // Player scripts may handle the click themselves by returning true.
++  if (m_player->inWorld()) {
++    auto handled = m_player->receiveMessage(m_player->world()->connection(), "osb.actionBarSlotRightClick", {index + 1, primary ? "primary" : "alt"});
++    if (handled && handled->isType(Json::Type::Bool) && handled->toBool())
++      return;
++  }
++
+   if (m_paneManager->registeredPaneIsDisplayed(MainInterfacePanes::Inventory)) {
+     auto inventory = m_player->inventory();
+     auto primarySlot = inventory->customBarPrimarySlot(index);
+diff --git a/source/frontend/StarContainerInterface.cpp b/source/frontend/StarContainerInterface.cpp
+index 6336099..7e9a87c 100644
+--- a/source/frontend/StarContainerInterface.cpp
++++ b/source/frontend/StarContainerInterface.cpp
+@@ -211,7 +211,7 @@ bool ContainerPane::giveContainerResult(ContainerResult result) {
+         inv->setSwapSlotItem(item);
+       }
+     } else {
+-      m_containerInteractor->addToContainer(inv->addItems(item));
++      m_containerInteractor->addToContainer(m_player->pickupItems(item, true));
+     }
+   }
+ 
+diff --git a/source/frontend/StarInterfaceLuaBindings.cpp b/source/frontend/StarInterfaceLuaBindings.cpp
+index cc62636..53a7708 100644
+--- a/source/frontend/StarInterfaceLuaBindings.cpp
++++ b/source/frontend/StarInterfaceLuaBindings.cpp
+@@ -31,6 +31,18 @@ LuaCallbacks LuaBindings::makeInterfaceCallbacks(MainInterface* mainInterface) {
+     return {};
+   });
+   
++  callbacks.registerCallback("openContainerId", [mainInterface]() -> Maybe<EntityId> {
++    return mainInterface->openContainerId();
++  });
++
++  callbacks.registerCallback("addToOpenContainer", [mainInterface](Json const& item) -> bool {
++    return mainInterface->addToOpenContainer(ItemDescriptor(item));
++  });
++
++  callbacks.registerCallback("addToOpenMerchant", [mainInterface](Json const& item) -> Json {
++    return mainInterface->addToOpenMerchant(ItemDescriptor(item)).toJson();
++  });
++
+   callbacks.registerCallback("displayRegisteredPane", [mainInterface](String const& registeredPaneName) {
+     auto pane = MainInterfacePanesNames.getLeft(registeredPaneName);
+     auto paneManager = mainInterface->paneManager();
+diff --git a/source/frontend/StarMainInterface.cpp b/source/frontend/StarMainInterface.cpp
+index 91a777f..c9d8129 100644
+--- a/source/frontend/StarMainInterface.cpp
++++ b/source/frontend/StarMainInterface.cpp
+@@ -243,12 +243,33 @@ void MainInterface::openMerchantWindow(Json const& config, EntityId sourceEntity
+   }
+ 
+   bool openWithInventory = config.getBool("openWithInventory", true);
+-  bool closeWithInventory = config.getBool("closeWithInventory", !m_paneManager.registeredPaneIsDisplayed(MainInterfacePanes::Inventory));
++  // Player scripts may show their own inventory window instead of the
++  // vanilla one by returning true.
++  bool scriptInventory = openWithInventory && !m_paneManager.registeredPaneIsDisplayed(MainInterfacePanes::Inventory)
++      && playerScriptHook("osb.merchantOpened", {sourceEntityId});
++  bool closeWithInventory = !scriptInventory
++      && config.getBool("closeWithInventory", !m_paneManager.registeredPaneIsDisplayed(MainInterfacePanes::Inventory));
+   m_merchantWindow = make_shared<MerchantPane>(m_client->worldClient(), m_client->mainPlayer(), config, sourceEntityId);
+-  m_paneManager.displayPane(PaneLayer::Window, m_merchantWindow, [this, closeWithInventory](PanePtr const&) {
++  m_paneManager.displayPane(PaneLayer::Window, m_merchantWindow, [this, closeWithInventory, scriptInventory](PanePtr const&) {
+     if (closeWithInventory)
+       m_paneManager.dismissRegisteredPane(MainInterfacePanes::Inventory);
++    if (scriptInventory) {
++      m_merchantBesideScriptPane = false;
++      playerScriptHook("osb.merchantClosed", {});
++    }
+    });
++
++  if (scriptInventory) {
++    // Same as containers: next to the scripted inventory window, now if it is
++    // already open, otherwise once it is displayed.
++    m_merchantBesideScriptPane = true;
++    for (auto const& pane : m_paneManager.getAllPanes()) {
++      if (placeMerchantBeside(pane))
++        break;
++    }
++    return;
++  }
++
+   if (openWithInventory)
+     m_paneManager.displayRegisteredPane(MainInterfacePanes::Inventory);
+ 
+@@ -424,21 +445,39 @@ void MainInterface::handleInteractAction(InteractAction interactAction) {
+ 
+     m_containerInteractor->openContainer(containerEntity);
+ 
+-    bool closeWithInventory = !m_paneManager.registeredPaneIsDisplayed(MainInterfacePanes::Inventory);
+-    m_paneManager.displayRegisteredPane(MainInterfacePanes::Inventory);
++    // Player scripts may show their own inventory window instead of the
++    // vanilla one by returning true.
++    bool vanillaInventory = !playerScriptHook("osb.containerOpened", {interactAction.entityId});
++    bool closeWithInventory = vanillaInventory && !m_paneManager.registeredPaneIsDisplayed(MainInterfacePanes::Inventory);
++    if (vanillaInventory)
++      m_paneManager.displayRegisteredPane(MainInterfacePanes::Inventory);
+ 
+     m_containerPane = make_shared<ContainerPane>(world, m_client->mainPlayer(), m_containerInteractor);
+-    m_paneManager.displayPane(PaneLayer::Window, m_containerPane, [this, closeWithInventory](PanePtr const&) {
++    m_paneManager.displayPane(PaneLayer::Window, m_containerPane, [this, closeWithInventory, vanillaInventory](PanePtr const&) {
+       if (closeWithInventory)
+         m_paneManager.dismissRegisteredPane(MainInterfacePanes::Inventory);
+       else {
+         m_containerInteractor->closeContainer();
+         m_containerPane = {};
+       }
++      if (!vanillaInventory) {
++        m_containerBesideScriptPane = false;
++        playerScriptHook("osb.containerClosed", {});
++      }
+     });
+ 
+-    m_paneManager.bringPaneAdjacent(m_paneManager.registeredPane(MainInterfacePanes::Inventory),
+-        m_containerPane, Root::singleton().assets()->json("/interface.config:bringAdjacentWindowGap").toFloat());
++    if (vanillaInventory) {
++      m_paneManager.bringPaneAdjacent(m_paneManager.registeredPane(MainInterfacePanes::Inventory),
++          m_containerPane, Root::singleton().assets()->json("/interface.config:bringAdjacentWindowGap").toFloat());
++    } else {
++      // Place the container next to the scripted inventory window, now if it
++      // is already open, otherwise once it is displayed.
++      m_containerBesideScriptPane = true;
++      for (auto const& pane : m_paneManager.getAllPanes()) {
++        if (placeContainerBeside(pane))
++          break;
++      }
++    }
+   } else if (interactAction.type == InteractActionType::SitDown) {
+     m_client->mainPlayer()->lounge(interactAction.entityId, interactAction.data.toUInt());
+   } else if (interactAction.type == InteractActionType::OpenCraftingInterface) {
+@@ -1605,7 +1644,9 @@ bool MainInterface::overlayClick(Vec2F const& mousePos, MouseButton) {
+   mainBarPoly.scale(interfaceScale(), Vec2F(barPos));
+ 
+   if (overButton(m_config->mainBarInventoryButtonPoly, mousePos)) {
+-    m_paneManager.toggleRegisteredPane(MainInterfacePanes::Inventory);
++    // Player scripts may replace the inventory button by returning true.
++    if (!playerScriptHook("osb.mainBarInventoryClick", {}))
++      m_paneManager.toggleRegisteredPane(MainInterfacePanes::Inventory);
+     return true;
+   }
+ 
+@@ -1657,6 +1698,36 @@ void MainInterface::initHttpTrustDialog() {
+   m_paneManager.registerPane(MainInterfacePanes::HttpTrustDialog, PaneLayer::ModalWindow, httpTrustDialog);
+ }
+ 
++Maybe<EntityId> MainInterface::openContainerId() const {
++  if (m_containerInteractor && m_containerInteractor->containerOpen())
++    return m_containerInteractor->openContainerId();
++  return {};
++}
++
++bool MainInterface::addToOpenContainer(ItemDescriptor const& descriptor) {
++  if (!m_containerInteractor || !m_containerInteractor->containerOpen() || descriptor.isNull())
++    return false;
++  m_containerInteractor->addToContainer(Root::singleton().itemDatabase()->item(descriptor));
++  return true;
++}
++
++ItemDescriptor MainInterface::addToOpenMerchant(ItemDescriptor const& descriptor) {
++  auto merchant = activeMerchantPane();
++  if (!merchant || descriptor.isNull())
++    return descriptor;
++  if (auto remainder = merchant->addItems(Root::singleton().itemDatabase()->item(descriptor)))
++    return remainder->descriptor();
++  return {};
++}
++
++bool MainInterface::playerScriptHook(String const& message, JsonArray const& args) {
++  auto player = m_client->mainPlayer();
++  if (!player || !player->inWorld())
++    return false;
++  auto handled = player->receiveMessage(player->world()->connection(), message, args);
++  return handled && handled->isType(Json::Type::Bool) && handled->toBool();
++}
++
+ void MainInterface::displayScriptPane(ScriptPanePtr& scriptPane, EntityId sourceEntity) {
+  // keep any number of script panes open with null source entities
+   if (sourceEntity != NullEntityId)
+@@ -1678,6 +1749,33 @@ void MainInterface::displayScriptPane(ScriptPanePtr& scriptPane, EntityId source
+   } else {
+     m_paneManager.displayPane(layer, scriptPane);
+   }
++
++  placeContainerBeside(scriptPane);
++  placeMerchantBeside(scriptPane);
++}
++
++bool MainInterface::placeMerchantBeside(PanePtr const& pane) {
++  if (!m_merchantBesideScriptPane || !m_merchantWindow || !m_paneManager.isDisplayed(m_merchantWindow))
++    return false;
++  auto scriptPane = as<ScriptPane>(pane);
++  if (!scriptPane || !m_paneManager.isDisplayed(pane) || !scriptPane->config().getBool("containerCompanion", false))
++    return false;
++  m_paneManager.bringPaneAdjacent(pane, m_merchantWindow,
++      Root::singleton().assets()->json("/interface.config:bringAdjacentWindowGap").toFloat());
++  m_merchantBesideScriptPane = false;
++  return true;
++}
++
++bool MainInterface::placeContainerBeside(PanePtr const& pane) {
++  if (!m_containerBesideScriptPane || !m_containerPane || !m_paneManager.isDisplayed(m_containerPane))
++    return false;
++  auto scriptPane = as<ScriptPane>(pane);
++  if (!scriptPane || !m_paneManager.isDisplayed(pane) || !scriptPane->config().getBool("containerCompanion", false))
++    return false;
++  m_paneManager.bringPaneAdjacent(pane, m_containerPane,
++      Root::singleton().assets()->json("/interface.config:bringAdjacentWindowGap").toFloat());
++  m_containerBesideScriptPane = false;
++  return true;
+ }
+ 
+ }
+diff --git a/source/frontend/StarMainInterface.hpp b/source/frontend/StarMainInterface.hpp
+index 05c7eab..fc30328 100644
+--- a/source/frontend/StarMainInterface.hpp
++++ b/source/frontend/StarMainInterface.hpp
+@@ -132,6 +132,15 @@ public:
+   void takeScriptPanes(List<ScriptPaneInfo>& out);
+   void reviveScriptPanes(List<ScriptPaneInfo>& panes);
+   void displayDefaultPanes();
++  // The container currently open through the interface, if any.
++  Maybe<EntityId> openContainerId() const;
++  // Sends items to the open container.  Items that do not fit come back as
++  // container results and are picked up by the player.
++  bool addToOpenContainer(ItemDescriptor const& descriptor);
++  // Puts items into the sell window of the open merchant (only while its sell
++  // tab is shown), returning what was not accepted.
++  ItemDescriptor addToOpenMerchant(ItemDescriptor const& descriptor);
++
+ private:
+   PanePtr createEscapeDialog();
+   void initHttpTrustDialog();
+@@ -157,6 +166,13 @@ private:
+   bool overlayClick(Vec2F const& mousePos, MouseButton mouseButton);
+ 
+   void displayScriptPane(ScriptPanePtr& scriptPane, EntityId sourceEntity);
++  // Sends a message to the main player's scripts, true if a handler returned true.
++  bool playerScriptHook(String const& message, JsonArray const& args);
++  // Moves the open container next to a displayed script pane whose config has
++  // "containerCompanion": true, if a container is waiting for one.
++  bool placeContainerBeside(PanePtr const& pane);
++  // The same for a merchant window opened without the vanilla inventory.
++  bool placeMerchantBeside(PanePtr const& pane);
+ 
+   GuiContext* m_guiContext{nullptr};
+   MainInterfaceConfigConstPtr m_config;
+@@ -230,6 +246,8 @@ private:
+   HashMap<EntityId, float> m_specialDamageBars;
+ 
+   ContainerInteractorPtr m_containerInteractor;
++  bool m_containerBesideScriptPane = false;
++  bool m_merchantBesideScriptPane = false;
+ };
+ 
+ }
+diff --git a/source/game/StarPlayer.cpp b/source/game/StarPlayer.cpp
+index e699997..07f15be 100644
+--- a/source/game/StarPlayer.cpp
++++ b/source/game/StarPlayer.cpp
+@@ -11,6 +11,7 @@
+ #include "StarItemDrop.hpp"
+ #include "StarMaterialDatabase.hpp"
+ #include "StarArmors.hpp"
++#include "StarCurrency.hpp"
+ #include "StarPlayerFactory.hpp"
+ #include "StarAssets.hpp"
+ #include "StarPlayerInventory.hpp"
+@@ -1292,11 +1293,13 @@ PlayerInventoryPtr Player::inventory() const {
+ }
+ 
+ uint64_t Player::itemsCanHold(ItemPtr const& items) const {
++  if (items && canInterceptPickup(items))
++    return items->count();
+   return m_inventory->itemsCanFit(items);
+ }
+ 
+ ItemPtr Player::pickupItems(ItemPtr const& items, bool silent) {
+-  if (isDead() || !items || m_inventory->itemsCanFit(items) == 0)
++  if (isDead() || !items || (m_inventory->itemsCanFit(items) == 0 && !canInterceptPickup(items)))
+     return items;
+ 
+   triggerPickupEvents(items);
+@@ -1312,7 +1315,131 @@ ItemPtr Player::pickupItems(ItemPtr const& items, bool silent) {
+     queueItemPickupMessage(itemDb->itemShared(items->descriptor()));
+   }
+ 
+-  return m_inventory->addItems(items);
++  return m_inventory->addItems(interceptPickup(items));
++}
++
++static Maybe<ItemDescriptor> virtualInventoryDescriptor(Json const& json) {
++  if (!json.isType(Json::Type::Object) || !json.contains("name"))
++    return {};
++  try {
++    Json parameters = json.get("parameters", JsonObject());
++    if (!parameters.isType(Json::Type::Object))
++      parameters = JsonObject();
++    int64_t count = json.getInt("count", 1);
++    if (count <= 0)
++      return {};
++    return ItemDescriptor(json.getString("name"), (uint64_t)count, parameters);
++  } catch (std::exception const& e) {
++    Logger::warn("Player: invalid virtual inventory item descriptor: {}", outputException(e, false));
++    return {};
++  }
++}
++
++List<ItemDescriptor> Player::virtualInventoryItems() const {
++  List<ItemDescriptor> result;
++  if (!isMaster() || m_inVirtualInventoryCall)
++    return result;
++
++  m_inVirtualInventoryCall = true;
++  auto resetFlag = finally([this]() { m_inVirtualInventoryCall = false; });
++  for (auto const& p : m_genericScriptContexts) {
++    auto revision = p.second->invoke<Json>("virtualInventoryRevision");
++    if (!revision) {
++      m_virtualInventoryCache.remove(p.first);
++      continue;
++    }
++    auto cached = m_virtualInventoryCache.ptr(p.first);
++    if (!cached || !(cached->first == *revision)) {
++      List<ItemDescriptor> items;
++      if (auto list = p.second->invoke<Json>("virtualInventoryItems")) {
++        if (list->isType(Json::Type::Array)) {
++          for (auto const& entry : list->iterateArray()) {
++            if (auto descriptor = virtualInventoryDescriptor(entry))
++              items.append(descriptor.take());
++          }
++        }
++      }
++      m_virtualInventoryCache[p.first] = {*revision, std::move(items)};
++      cached = m_virtualInventoryCache.ptr(p.first);
++    }
++    result.appendAll(cached->second);
++  }
++  return result;
++}
++
++uint64_t Player::virtualInventoryCount(ItemDescriptor const& descriptor, bool exactMatch) const {
++  auto one = descriptor.singular();
++  uint64_t count = 0;
++  for (auto const& item : virtualInventoryItems()) {
++    if (one.matches(item, exactMatch))
++      count += item.count();
++  }
++  return count;
++}
++
++uint64_t Player::virtualInventoryConsume(ItemDescriptor const& descriptor, bool exactMatch) {
++  if (!isMaster() || m_inVirtualInventoryCall || descriptor.count() == 0)
++    return 0;
++
++  uint64_t consumed = 0;
++  m_inVirtualInventoryCall = true;
++  auto resetFlag = finally([this]() { m_inVirtualInventoryCall = false; });
++  for (auto const& p : m_genericScriptContexts) {
++    if (consumed >= descriptor.count())
++      break;
++    auto remaining = descriptor.withCount(descriptor.count() - consumed);
++    if (auto result = p.second->invoke<Json>("virtualInventoryConsume", remaining.toJson(), exactMatch)) {
++      if (result->canConvert(Json::Type::Int))
++        consumed += min<uint64_t>(remaining.count(), (uint64_t)max<int64_t>(0, result->toInt()));
++      // Revision is expected to change, but never trust a stale cache after a consume.
++      m_virtualInventoryCache.remove(p.first);
++    }
++  }
++  return consumed;
++}
++
++bool Player::canInterceptPickup(ItemPtr const& items) const {
++  if (!isMaster() || m_inVirtualInventoryCall || m_suppressPickupIntercept || !items || items->empty() || is<CurrencyItem>(items))
++    return false;
++
++  bool accepted = false;
++  m_inVirtualInventoryCall = true;
++  auto resetFlag = finally([this]() { m_inVirtualInventoryCall = false; });
++  auto descriptor = items->descriptor().toJson();
++  for (auto const& p : m_genericScriptContexts) {
++    if (p.second->invoke<bool>("canInterceptItemPickup", descriptor).value(false)) {
++      accepted = true;
++      break;
++    }
++  }
++  return accepted;
++}
++
++ItemPtr Player::interceptPickup(ItemPtr items) {
++  if (!isMaster() || m_inVirtualInventoryCall || m_suppressPickupIntercept || !items || items->empty() || is<CurrencyItem>(items))
++    return items;
++
++  auto itemDb = Root::singleton().itemDatabase();
++  m_inVirtualInventoryCall = true;
++  auto resetFlag = finally([this]() { m_inVirtualInventoryCall = false; });
++  for (auto const& p : m_genericScriptContexts) {
++    auto result = p.second->invoke<Json>("interceptItemPickup", items->descriptor().toJson());
++    // Function missing or errored, or explicitly declined: leave the items alone.
++    if (!result || (result->isType(Json::Type::Bool) && !result->toBool()))
++      continue;
++    if (result->isNull()) {
++      items = {};
++      break;
++    }
++    if (auto remainder = virtualInventoryDescriptor(*result)) {
++      if (remainder->count() < items->count())
++        items = itemDb->item(remainder.take());
++    } else {
++      items = {};
++      break;
++    }
++  }
++  return items;
+ }
+ 
+ void Player::giveItem(ItemPtr const& item) {
+@@ -1362,22 +1489,29 @@ ItemPtr Player::essentialItem(EssentialItem essentialItem) const {
+   return m_inventory->essentialItem(essentialItem);
+ }
+ 
+-bool Player::hasItem(ItemDescriptor const& descriptor, bool exactMatch) const {
+-  return m_inventory->hasItem(descriptor, exactMatch);
++bool Player::hasItem(ItemDescriptor const& descriptor, bool exactMatch, bool includeVirtual) const {
++  return m_inventory->hasItem(descriptor, exactMatch, includeVirtual);
+ }
+ 
+-uint64_t Player::hasCountOfItem(ItemDescriptor const& descriptor, bool exactMatch) const {
+-  return m_inventory->hasCountOfItem(descriptor, exactMatch);
++uint64_t Player::hasCountOfItem(ItemDescriptor const& descriptor, bool exactMatch, bool includeVirtual) const {
++  return m_inventory->hasCountOfItem(descriptor, exactMatch, includeVirtual);
+ }
+ 
+-ItemDescriptor Player::takeItem(ItemDescriptor const& descriptor, bool consumePartial, bool exactMatch) {
+-  return m_inventory->takeItems(descriptor, consumePartial, exactMatch);
++ItemDescriptor Player::takeItem(ItemDescriptor const& descriptor, bool consumePartial, bool exactMatch, bool includeVirtual) {
++  return m_inventory->takeItems(descriptor, consumePartial, exactMatch, includeVirtual);
+ }
+ 
+ void Player::giveItem(ItemDescriptor const& descriptor) {
+   giveItem(Root::singleton().itemDatabase()->item(descriptor));
+ }
+ 
++void Player::giveItemWithoutIntercept(ItemDescriptor const& descriptor) {
++  bool previous = m_suppressPickupIntercept;
++  m_suppressPickupIntercept = true;
++  auto restore = finally([this, previous]() { m_suppressPickupIntercept = previous; });
++  giveItem(descriptor);
++}
++
+ void Player::clearSwap() {
+   // If we cannot put the swap slot back into the bag, then just drop it in the
+   // world.
+diff --git a/source/game/StarPlayer.hpp b/source/game/StarPlayer.hpp
+index b29549a..7ba09c4 100644
+--- a/source/game/StarPlayer.hpp
++++ b/source/game/StarPlayer.hpp
+@@ -228,12 +228,28 @@ public:
+   void triggerPickupEvents(ItemPtr const& item);
+ 
+   ItemPtr essentialItem(EssentialItem essentialItem) const;
+-  bool hasItem(ItemDescriptor const& descriptor, bool exactMatch = false) const;
+-  uint64_t hasCountOfItem(ItemDescriptor const& descriptor, bool exactMatch = false) const;
++  bool hasItem(ItemDescriptor const& descriptor, bool exactMatch = false, bool includeVirtual = true) const;
++  uint64_t hasCountOfItem(ItemDescriptor const& descriptor, bool exactMatch = false, bool includeVirtual = true) const;
+   // altough multiple entries may match, they might have different
+   // serializations
+-  ItemDescriptor takeItem(ItemDescriptor const& descriptor, bool consumePartial = false, bool exactMatch = false);
++  ItemDescriptor takeItem(ItemDescriptor const& descriptor, bool consumePartial = false, bool exactMatch = false, bool includeVirtual = true);
++
++  // Virtual inventory: generic player scripts may expose extra item storage
++  // that counts as part of the player's inventory for crafting, quests and
++  // item consumption, and may intercept item pickups.  Script functions:
++  //   virtualInventoryRevision() -> Json, items are re-queried when it changes
++  //   virtualInventoryItems() -> list of item descriptors
++  //   virtualInventoryConsume(descriptor, exactMatch) -> count consumed
++  //   canInterceptItemPickup(descriptor) -> bool
++  //   interceptItemPickup(descriptor) -> nil (all taken), false (declined)
++  //                                      or the remaining descriptor
++  List<ItemDescriptor> virtualInventoryItems() const;
++  uint64_t virtualInventoryCount(ItemDescriptor const& descriptor, bool exactMatch = false) const;
++  uint64_t virtualInventoryConsume(ItemDescriptor const& descriptor, bool exactMatch = false);
+   void giveItem(ItemDescriptor const& descriptor);
++  // Gives the item to the real inventory, bypassing virtual inventory pickup
++  // interception (used for items given by scripts).
++  void giveItemWithoutIntercept(ItemDescriptor const& descriptor);
+ 
+   // Clear the item swap slot.
+   void clearSwap();
+@@ -572,6 +588,12 @@ private:
+ 
+   UniverseClient* m_client; // required for celestial callbacks in scripts
+   StringMap<GenericScriptComponentPtr> m_genericScriptContexts;
++  mutable StringMap<pair<Json, List<ItemDescriptor>>> m_virtualInventoryCache;
++  mutable bool m_inVirtualInventoryCall = false;
++  bool m_suppressPickupIntercept = false;
++
++  bool canInterceptPickup(ItemPtr const& items) const;
++  ItemPtr interceptPickup(ItemPtr items);
+   JsonObject m_genericProperties;
+ 
+   State m_state;
+diff --git a/source/game/StarPlayerInventory.cpp b/source/game/StarPlayerInventory.cpp
+index e58598a..96f3738 100644
+--- a/source/game/StarPlayerInventory.cpp
++++ b/source/game/StarPlayerInventory.cpp
+@@ -1,1180 +1,1217 @@
+-#include "StarPlayerInventory.hpp"
+-#include "StarRoot.hpp"
+-#include "StarCurrency.hpp"
+-#include "StarArmors.hpp"
+-#include "StarLiquidItem.hpp"
+-#include "StarMaterialItem.hpp"
+-#include "StarObjectItem.hpp"
+-#include "StarItemDatabase.hpp"
+-#include "StarPointableItem.hpp"
+-#include "StarItemBag.hpp"
+-#include "StarAssets.hpp"
+-#include "StarJsonExtra.hpp"
+-#include "StarPlayer.hpp"
+-
+-namespace Star {
+-
+-bool PlayerInventory::itemAllowedInBag(ItemPtr const& items, String const& bagType) {
+-  // any inventory type can have empty slots
+-  if (!items)
+-    return true;
+-
+-  return checkInventoryFilter(items, bagType);
+-}
+-
+-bool PlayerInventory::itemAllowedAsEquipment(ItemPtr const& item, EquipmentSlot equipmentSlot) {
+-  // any equipment slot can be empty
+-  if (!item)
+-    return true;
+-
+-  if (equipmentSlot == EquipmentSlot::Head || equipmentSlot == EquipmentSlot::HeadCosmetic)
+-    return is<HeadArmor>(item);
+-  else if (equipmentSlot == EquipmentSlot::Chest || equipmentSlot == EquipmentSlot::ChestCosmetic)
+-    return is<ChestArmor>(item);
+-  else if (equipmentSlot == EquipmentSlot::Legs || equipmentSlot == EquipmentSlot::LegsCosmetic)
+-    return is<LegsArmor>(item);
+-  else if (equipmentSlot == EquipmentSlot::Back || equipmentSlot == EquipmentSlot::BackCosmetic)
+-    return is<BackArmor>(item);
+-  else
+-    return is<ArmorItem>(item);
+-}
+-
+-PlayerInventory::PlayerInventory() {
+-  auto config = Root::singleton().assets()->json("/player.config:inventory");
+-
+-  auto bags = config.get("itemBags");
+-  auto bagOrder = bags.toObject().keys().sorted([&bags](String const& a, String const& b) {
+-    return bags.get(a).getInt("priority", 0) < bags.get(b).getInt("priority", 0);
+-  });
+-  for (auto name : bagOrder) {
+-    size_t size = bags.get(name).getUInt("size");
+-    m_bags[name] = make_shared<ItemBag>(size);
+-    m_bagsNetState[name].resize(size);
+-  }
+-
+-  auto currenciesConfig = Root::singleton().assets()->json("/currencies.config");
+-  for (auto p : currenciesConfig.iterateObject())
+-    m_currencies[p.first] = 0;
+-
+-  size_t customBarGroups = config.getUInt("customBarGroups");
+-  size_t customBarIndexes = config.getUInt("customBarIndexes");
+-  m_customBarGroup = 0;
+-  m_customBar.resize(customBarGroups, customBarIndexes);
+-
+-  for (auto slot : EquipmentSlotNames) {
+-    auto& element = m_equipmentNetState[slot.first];
+-    if (slot.first > EquipmentSlot::BackCosmetic)
+-      element.setCompatibilityVersion(9);
+-    addNetElement(&element);
+-  }
+-
+-  for (auto& p : m_bagsNetState) {
+-    for (auto& e : p.second)
+-      addNetElement(&e);
+-  }
+-
+-  addNetElement(&m_swapSlotNetState);
+-  addNetElement(&m_trashSlotNetState);
+-
+-  addNetElement(&m_currenciesNetState);
+-
+-  addNetElement(&m_customBarGroupNetState);
+-  m_customBarNetState.resize(customBarGroups, customBarIndexes);
+-  m_customBarNetState.forEach([this](Array2S const&, NetElementData<CustomBarLink>& e) {
+-      addNetElement(&e);
+-    });
+-
+-  addNetElement(&m_selectedActionBarNetState);
+-
+-  addNetElement(&m_essentialNetState[EssentialItem::BeamAxe]);
+-  addNetElement(&m_essentialNetState[EssentialItem::WireTool]);
+-  addNetElement(&m_essentialNetState[EssentialItem::PaintTool]);
+-  addNetElement(&m_essentialNetState[EssentialItem::InspectionTool]);
+-
+-  m_equipmentVisibilityMask = 0xFFFFFFFF;
+-  m_player = nullptr;
+-}
+-
+-ItemPtr PlayerInventory::itemsAt(InventorySlot const& slot) const {
+-  return retrieve(slot);
+-}
+-
+-ItemPtr PlayerInventory::stackWith(InventorySlot const& slot, ItemPtr const& items) {
+-  if (!items || items->empty())
+-    return {};
+-
+-  if (auto es = slot.ptr<EquipmentSlot>()) {
+-    auto& itemSlot = retrieve(slot);
+-    if (!itemSlot && itemAllowedAsEquipment(items, *es))
+-      m_equipment[*es] = items->take(1);
+-  } else {
+-    auto& dest = retrieve(slot);
+-    if (dest && dest->stackableWith(items))
+-      dest->stackWith(items);
+-    if (!dest)
+-      dest = items->take(items->count());
+-  }
+-
+-  if (items->empty())
+-    return {};
+-
+-  return items;
+-}
+-
+-ItemPtr PlayerInventory::takeSlot(InventorySlot const& slot) {
+-  if (slot.is<SwapSlot>())
+-    m_swapReturnSlot = {};
+-  return take(retrieve(slot));
+-}
+-
+-bool PlayerInventory::exchangeItems(InventorySlot const& first, InventorySlot const& second) {
+-  auto& firstItems = retrieve(first);
+-  auto& secondItems = retrieve(second);
+-
+-  if (first.is<BagSlot>() && !itemAllowedInBag(secondItems, first.get<BagSlot>().first))
+-    return false;
+-  if (second.is<BagSlot>() && !itemAllowedInBag(firstItems, second.get<BagSlot>().first))
+-    return false;
+-  if (first.is<EquipmentSlot>() && (secondItems->count() > 1 || !itemAllowedAsEquipment(secondItems, first.get<EquipmentSlot>())))
+-    return false;
+-  if (second.is<EquipmentSlot>() && (firstItems->count() > 1 || !itemAllowedAsEquipment(firstItems, second.get<EquipmentSlot>())))
+-    return false;
+-
+-  swap(firstItems, secondItems);
+-  swapCustomBarLinks(first, second);
+-
+-  return true;
+-}
+-
+-bool PlayerInventory::setItem(InventorySlot const& slot, ItemPtr const& item) {
+-  if (auto currencyItem = as<CurrencyItem>(item)) {
+-    m_currencies[currencyItem->currencyType()] += currencyItem->totalValue();
+-    return true;
+-  } else if (auto es = slot.ptr<EquipmentSlot>()) {
+-    if (itemAllowedAsEquipment(item, *es)) {
+-      m_equipment[*es] = item;
+-      return true;
+-    }
+-  } else if (slot.is<SwapSlot>()) {
+-    m_swapSlot = item;
+-    return true;
+-  } else if (slot.is<TrashSlot>()) {
+-    m_trashSlot = item;
+-    return true;
+-  } else {
+-    auto bs = slot.get<BagSlot>();
+-    if (itemAllowedInBag(item, bs.first)) {
+-      m_bags[bs.first]->setItem(bs.second, item);
+-      return true;
+-    }
+-  }
+-
+-  return false;
+-}
+-
+-bool PlayerInventory::consumeSlot(InventorySlot const& slot, uint64_t count) {
+-  if (count == 0)
+-    return true;
+-
+-  auto& item = retrieve(slot);
+-  if (!item)
+-    return false;
+-
+-  bool consumed = item->consume(count);
+-  if (item->empty())
+-    item = {};
+-
+-  return consumed;
+-}
+-
+-bool PlayerInventory::slotValid(InventorySlot const& slot) const {
+-  if (auto bagSlot = slot.ptr<BagSlot>()) {
+-    if (auto bag = bagContents(bagSlot->first)) {
+-      if ((size_t)bagSlot->second >= bag->size())
+-        return false;
+-    }
+-    else return false;
+-  }
+-  return true;
+-}
+-
+-ItemPtr PlayerInventory::addItems(ItemPtr items) {
+-  if (!items || items->empty())
+-    return {};
+-
+-  // First, add coins as monetary value.
+-  if (auto currencyItem = as<CurrencyItem>(items)) {
+-    addCurrency(currencyItem->currencyType(), currencyItem->totalValue());
+-    return {};
+-  }
+-
+-  // Then, try adding equipment to the equipment slots.
+-  if (is<HeadArmor>(items) && !headArmor())
+-    m_equipment[EquipmentSlot::Head] = items->take(1);
+-  if (is<ChestArmor>(items) && !chestArmor())
+-    m_equipment[EquipmentSlot::Chest] = items->take(1);
+-  if (is<LegsArmor>(items) && !legsArmor())
+-    m_equipment[EquipmentSlot::Legs] = items->take(1);
+-  if (is<BackArmor>(items) && !backArmor())
+-    m_equipment[EquipmentSlot::Back] = items->take(1);
+-
+-  if (is<MaterialItem>(items)) {
+-    if (auto primary = primaryHeldItem()) {
+-      primary->stackWith(items);
+-      if (items->empty())
+-        return {};
+-    }
+-  }
+-
+-  // Then, finally the bags
+-  return addToBags(std::move(items));
+-}
+-
+-ItemPtr PlayerInventory::addToBags(ItemPtr items) {
+-  if (!items || items->empty())
+-    return {};
+-
+-  for (auto pair : m_bags) {
+-    if (!itemAllowedInBag(items, pair.first))
+-      continue;
+-
+-    items = pair.second->stackItems(items);
+-    if (!items)
+-      break;
+-
+-    for (unsigned i = 0; i < pair.second->size(); ++i) {
+-      if (!pair.second->at(i)) {
+-        pair.second->setItem(i, take(items));
+-        autoAddToCustomBar(BagSlot(pair.first, i));
+-        break;
+-      }
+-    }
+-  }
+-
+-  return items;
+-}
+-
+-uint64_t PlayerInventory::itemsCanFit(ItemPtr const& items) const {
+-  if (!items || items->empty())
+-    return 0;
+-
+-  if (is<CurrencyItem>(items))
+-    return items->count();
+-
+-  uint64_t canFit = 0;
+-
+-  // First, check the equipment slots
+-  if (is<HeadArmor>(items) && !headArmor())
+-    ++canFit;
+-  if (is<ChestArmor>(items) && !chestArmor())
+-    ++canFit;
+-  if (is<LegsArmor>(items) && !legsArmor())
+-    ++canFit;
+-  if (is<BackArmor>(items) && !backArmor())
+-    ++canFit;
+-
+-  // Then add into bags
+-  for (auto const& pair : m_bags) {
+-    if (itemAllowedInBag(items, pair.first))
+-      canFit += pair.second->itemsCanFit(items);
+-  }
+-
+-  return min(canFit, items->count());
+-}
+-
+-bool PlayerInventory::hasItem(ItemDescriptor const& descriptor, bool exactMatch) const {
+-  return hasCountOfItem(descriptor, exactMatch) >= descriptor.count();
+-}
+-
+-uint64_t PlayerInventory::hasCountOfItem(ItemDescriptor const& descriptor, bool exactMatch) const {
+-  auto one = descriptor.singular();
+-
+-  uint64_t count = 0;
+-  auto countItem = [&](ItemPtr const& ptr) {
+-    if (ptr)
+-      count += ptr->matches(one, exactMatch) ? ptr->count() : 0;
+-  };
+-
+-  countItem(m_swapSlot);
+-  countItem(m_trashSlot);
+-  for (auto const& p : m_equipment)
+-    countItem(p.second);
+-
+-  for (auto const& pair : m_bags)
+-    count += pair.second->available(one, exactMatch);
+-
+-  return count;
+-}
+-
+-bool PlayerInventory::consumeItems(ItemDescriptor const& descriptor, bool exactMatch) {
+-  if (descriptor.count() == 0)
+-    return true;
+-
+-  auto one = descriptor.singular();
+-
+-  Map<String, uint64_t> consumeFromItemBags;
+-  for (auto pair : m_bags)
+-    consumeFromItemBags[pair.first] = pair.second->available(one);
+-
+-  uint64_t consumeFromEquipment = 0;
+-  for (auto const& p : m_equipment) {
+-    if (p.second)
+-      consumeFromEquipment += p.second->matches(one, exactMatch) ? p.second->count() : 0;
+-  }
+-
+-  uint64_t consumeFromSwap = 0;
+-  if (m_swapSlot)
+-    consumeFromSwap += m_swapSlot->matches(one, exactMatch) ? m_swapSlot->count() : 0;
+-
+-  uint64_t consumeFromTrash = 0;
+-  if (m_trashSlot)
+-    consumeFromTrash += m_trashSlot->matches(one, exactMatch) ? m_trashSlot->count() : 0;
+-
+-  auto totalAvailable = consumeFromEquipment + consumeFromSwap + consumeFromTrash;
+-  for (auto pair : consumeFromItemBags)
+-    totalAvailable += pair.second;
+-
+-  if (totalAvailable < descriptor.count())
+-    return false;
+-
+-  uint64_t leftoverCount = descriptor.count();
+-  uint64_t quantity;
+-  for (auto pair : m_bags) {
+-    quantity = min(leftoverCount, consumeFromItemBags[pair.first]);
+-    if (quantity > 0) {
+-      auto res = pair.second->consumeItems(one.multiply(quantity), exactMatch);
+-      _unused(res);
+-      starAssert(res);
+-      leftoverCount -= quantity;
+-    }
+-  }
+-
+-  quantity = min(leftoverCount, consumeFromEquipment);
+-  if (quantity > 0) {
+-    auto leftoverQuantity = quantity;
+-    _unused(leftoverQuantity);
+-    for (auto const& p : m_equipment) {
+-      if (p.second && p.second->matches(one, exactMatch)) {
+-        auto toConsume = min(p.second->count(), quantity);
+-        auto res = p.second->consume(toConsume);
+-        _unused(res);
+-        starAssert(res);
+-
+-        leftoverQuantity -= toConsume;
+-      }
+-    }
+-    starAssert(leftoverQuantity == 0);
+-    leftoverCount -= quantity;
+-  }
+-
+-  quantity = std::min(leftoverCount, consumeFromSwap);
+-  if (quantity > 0) {
+-    if (m_swapSlot && m_swapSlot->matches(one, exactMatch)) {
+-      auto toConsume = std::min(m_swapSlot->count(), quantity);
+-      auto res = m_swapSlot->consume(toConsume);
+-      _unused(res);
+-      starAssert(res);
+-
+-      quantity -= toConsume;
+-      starAssert(quantity == 0);
+-    }
+-    leftoverCount -= std::min(leftoverCount, consumeFromSwap);
+-  }
+-
+-  quantity = std::min(leftoverCount, consumeFromTrash);
+-  if (quantity > 0) {
+-    if (m_trashSlot && m_trashSlot->matches(one, exactMatch)) {
+-      auto toConsume = std::min(m_trashSlot->count(), quantity);
+-      auto res = m_trashSlot->consume(toConsume);
+-      _unused(res);
+-      starAssert(res);
+-
+-      quantity -= toConsume;
+-      starAssert(quantity == 0);
+-    }
+-    leftoverCount -= std::min(leftoverCount, consumeFromTrash);
+-  }
+-
+-  starAssert(leftoverCount == 0);
+-  return true;
+-}
+-
+-ItemDescriptor PlayerInventory::takeItems(ItemDescriptor const& descriptor, bool takePartial, bool exactMatch) {
+-  uint64_t hasCount = hasCountOfItem(descriptor, exactMatch);
+-
+-  if (hasCount >= descriptor.count() || (takePartial && hasCount > 0)) {
+-    ItemDescriptor consumeDescriptor = descriptor.withCount(min(descriptor.count(), hasCount));
+-    consumeItems(consumeDescriptor, exactMatch);
+-    return consumeDescriptor;
+-  }
+-
+-  return {};
+-}
+-
+-HashMap<ItemDescriptor, uint64_t> PlayerInventory::availableItems() const {
+-  return ItemDatabase::normalizeBag(allItems());
+-}
+-
+-HeadArmorPtr PlayerInventory::headArmor() const {
+-  return as<HeadArmor>(m_equipment.value(EquipmentSlot::Head));
+-}
+-
+-ChestArmorPtr PlayerInventory::chestArmor() const {
+-  return as<ChestArmor>(m_equipment.value(EquipmentSlot::Chest));
+-}
+-
+-LegsArmorPtr PlayerInventory::legsArmor() const {
+-  return as<LegsArmor>(m_equipment.value(EquipmentSlot::Legs));
+-}
+-
+-BackArmorPtr PlayerInventory::backArmor() const {
+-  return as<BackArmor>(m_equipment.value(EquipmentSlot::Back));
+-}
+-
+-HeadArmorPtr PlayerInventory::headCosmetic() const {
+-  return as<HeadArmor>(m_equipment.value(EquipmentSlot::HeadCosmetic));
+-}
+-
+-ChestArmorPtr PlayerInventory::chestCosmetic() const {
+-  return as<ChestArmor>(m_equipment.value(EquipmentSlot::ChestCosmetic));
+-}
+-
+-LegsArmorPtr PlayerInventory::legsCosmetic() const {
+-  return as<LegsArmor>(m_equipment.value(EquipmentSlot::LegsCosmetic));
+-}
+-
+-BackArmorPtr PlayerInventory::backCosmetic() const {
+-  return as<BackArmor>(m_equipment.value(EquipmentSlot::BackCosmetic));
+-}
+-
+-ArmorItemPtr PlayerInventory::equipment(EquipmentSlot slot, bool testMask) const {
+-  if (testMask && !equipmentVisibility(slot))
+-    return {};
+-
+-  if (auto item = m_equipment.ptr(slot))
+-    if (auto armor = as<ArmorItem>(*item))
+-      return armor;
+-
+-  return {};
+-}
+-
+-ItemBagConstPtr PlayerInventory::bagContents(String const& type) const {
+-  if (!m_bags.contains(type)) return nullptr;
+-  return m_bags.get(type);
+-}
+-
+-void PlayerInventory::condenseBagStacks(String const& bagType) {
+-  auto bag = m_bags[bagType];
+-
+-  bag->condenseStacks();
+-
+-  m_customBar.forEach([&](auto const&, CustomBarLink& link) {
+-      if (link.first) {
+-        if (auto bs = link.first->ptr<BagSlot>()) {
+-          if (bs->first == bagType && !bag->at(bs->second))
+-            link.first = {};
+-        }
+-      }
+-      if (link.second) {
+-        if (auto bs = link.second->ptr<BagSlot>()) {
+-          if (bs->first == bagType && !bag->at(bs->second))
+-            link.second = {};
+-        }
+-      }
+-    });
+-}
+-
+-void PlayerInventory::sortBag(String const& bagType) {
+-  auto bag = m_bags[bagType];
+-
+-  // When sorting bags, we need to record where all the action bar links were
+-  // pointing if any of them were pointing to the bag we are about to sort.
+-  MultiArray<pair<ItemPtr, ItemPtr>, 2> savedCustomBar(m_customBar.size());
+-  m_customBar.forEach([&](auto const& index, CustomBarLink const& link) {
+-      if (link.first) {
+-        if (auto bs = link.first->ptr<BagSlot>()) {
+-          if (bs->first == bagType)
+-            savedCustomBar(index).first = bag->at(bs->second);
+-        }
+-      }
+-      if (link.second) {
+-        if (auto bs = link.second->ptr<BagSlot>()) {
+-          if (bs->first == bagType)
+-            savedCustomBar(index).second = bag->at(bs->second);
+-        }
+-      }
+-    });
+-
+-  auto itemDatabase = Root::singletonPtr()->itemDatabase();
+-  bag->items().sort([itemDatabase](ItemPtr const& a, ItemPtr const& b) {
+-      if (a && !b)
+-        return true;
+-      if (!a)
+-        return false;
+-
+-      auto aType = itemDatabase->itemType(a->name());
+-      auto bType = itemDatabase->itemType(b->name());
+-      if (aType != bType)
+-        return aType < bType;
+-
+-      if (a->rarity() != b->rarity())
+-        return a->rarity() > b->rarity();
+-
+-      if (a->name().compare(b->name()) != 0)
+-        return a->name().compare(b->name()) < 0;
+-
+-      if (a->count() != b->count())
+-        return a->count() > b->count();
+-
+-      return false;
+-    });
+-
+-  // Once we are done sorting, we need to restore the potentially action bar
+-  // links to point to where the item with the same identity is now residing.
+-
+-  Map<ItemPtr, size_t> itemIndexes;
+-  for (size_t i = 0; i < bag->size(); ++i) {
+-    if (auto item = bag->at(i))
+-      itemIndexes[item] = i;
+-  }
+-
+-  savedCustomBar.forEach([&](auto const& index, auto const& savedItems) {
+-      if (savedItems.first)
+-        m_customBar.at(index).first.set(BagSlot(bagType, itemIndexes.get(savedItems.first)));
+-      if (savedItems.second)
+-        m_customBar.at(index).second.set(BagSlot(bagType, itemIndexes.get(savedItems.second)));
+-    });
+-}
+-
+-void PlayerInventory::shiftSwap(InventorySlot const& slot) {
+-  if (auto es = slot.ptr<EquipmentSlot>()) {
+-    if (itemAllowedAsEquipment(m_swapSlot, *es)) {
+-      auto& equipSlot = m_equipment[*es];
+-      if (itemSafeCount(m_swapSlot) <= 1) {
+-        swap(m_swapSlot, equipSlot);
+-        swapCustomBarLinks(SwapSlot(), slot);
+-      } else if (itemSafeCount(equipSlot) == 0) {
+-        equipSlot = m_swapSlot->take(1);
+-      }
+-    }
+-  } else if (slot.is<TrashSlot>()) {
+-    swap(m_swapSlot, m_trashSlot);
+-    swapCustomBarLinks(SwapSlot(), slot);
+-  } else if (auto bs = slot.ptr<BagSlot>()) {
+-    if (itemAllowedInBag(m_swapSlot, bs->first)) {
+-      m_swapSlot = m_bags[bs->first]->swapItems(bs->second, m_swapSlot);
+-      swapCustomBarLinks(SwapSlot(), slot);
+-    }
+-  }
+-
+-  if (!m_swapSlot)
+-    m_swapReturnSlot = {};
+-  else
+-    m_swapReturnSlot = slot;
+-}
+-
+-bool PlayerInventory::clearSwap() {
+-  auto trySlot = [&](InventorySlot slot) {
+-    if (!m_swapSlot)
+-      return;
+-
+-    m_swapSlot = stackWith(slot, m_swapSlot);
+-    if (!m_swapSlot)
+-      swapCustomBarLinks(SwapSlot(), slot);
+-  };
+-
+-  auto tryBag = [&](String const& bagType) {
+-    for (unsigned i = 0; i < m_bags[bagType]->size(); ++i) {
+-      if (!m_swapSlot || !itemAllowedInBag(m_swapSlot, bagType))
+-        break;
+-      trySlot(BagSlot(bagType, i));
+-    }
+-  };
+-
+-  if (m_swapReturnSlot)
+-    trySlot(m_swapReturnSlot.take());
+-
+-  trySlot(EquipmentSlot::Head);
+-  trySlot(EquipmentSlot::Chest);
+-  trySlot(EquipmentSlot::Legs);
+-  trySlot(EquipmentSlot::Back);
+-
+-  for (auto bagType : m_bags.keys())
+-    tryBag(bagType);
+-
+-  return !m_swapSlot;
+-}
+-
+-ItemPtr PlayerInventory::swapSlotItem() const {
+-  return m_swapSlot;
+-}
+-
+-void PlayerInventory::setSwapSlotItem(ItemPtr const& items) {
+-  if (auto currencyItem = as<CurrencyItem>(items)) {
+-    addCurrency(currencyItem->currencyType(), currencyItem->totalValue());
+-    m_swapSlot = {};
+-  } else {
+-    m_swapSlot = items;
+-    autoAddToCustomBar(SwapSlot());
+-  }
+-}
+-
+-ItemPtr PlayerInventory::essentialItem(EssentialItem essentialItem) const {
+-  return m_essential.value(essentialItem);
+-}
+-
+-void PlayerInventory::setEssentialItem(EssentialItem essentialItem, ItemPtr item) {
+-  m_essential[essentialItem] = item;
+-}
+-
+-StringMap<uint64_t> PlayerInventory::availableCurrencies() const {
+-  return m_currencies;
+-}
+-
+-uint64_t PlayerInventory::currency(String const& currencyType) const {
+-  return m_currencies.value(currencyType, 0);
+-}
+-
+-void PlayerInventory::addCurrency(String const& currencyType, uint64_t amount) {
+-  uint64_t previousTotal = m_currencies[currencyType];
+-  uint64_t newTotal = previousTotal + amount;
+-  if (newTotal < previousTotal)
+-    newTotal = highest<uint64_t>();
+-  m_currencies[currencyType] = min(Root::singleton().assets()->json("/currencies.config").get(currencyType).getUInt("playerMax", highest<uint64_t>()), newTotal);
+-}
+-
+-bool PlayerInventory::consumeCurrency(String const& currencyType, uint64_t amount) {
+-  if (m_currencies[currencyType] >= amount) {
+-    m_currencies[currencyType] -= amount;
+-    return true;
+-  } else {
+-    return false;
+-  }
+-}
+-
+-Maybe<InventorySlot> PlayerInventory::customBarPrimarySlot(CustomBarIndex customBarIndex) const {
+-  return m_customBar.at(m_customBarGroup, customBarIndex).first;
+-}
+-
+-Maybe<InventorySlot> PlayerInventory::customBarSecondarySlot(CustomBarIndex customBarIndex) const {
+-  return m_customBar.at(m_customBarGroup, customBarIndex).second;
+-}
+-
+-void PlayerInventory::setCustomBarPrimarySlot(CustomBarIndex customBarIndex, Maybe<InventorySlot> slot) {
+-  // The primary slot is not allowed to point to an empty item.
+-  if (slot) {
+-    if (!itemsAt(*slot))
+-      slot = {};
+-  }
+-
+-  auto& cbl = m_customBar.at(m_customBarGroup, customBarIndex);
+-  if (slot && cbl.second == slot) {
+-    // If we match the secondary slot, just swap the slots for primary and
+-    // secondary
+-    swap(cbl.first, cbl.second);
+-  } else {
+-    cbl.first = slot;
+-  }
+-}
+-
+-void PlayerInventory::setCustomBarSecondarySlot(CustomBarIndex customBarIndex, Maybe<InventorySlot> slot) {
+-  auto& cbl = m_customBar.at(m_customBarGroup, customBarIndex);
+-  // The secondary slot is not allowed to point to an empty item or a two
+-  // handed item.
+-  if (slot) {
+-    if (!itemsAt(*slot) || itemSafeTwoHanded(itemsAt(*slot)))
+-      slot = {};
+-  }
+-
+-  if (cbl.first && cbl.first == slot && !itemSafeTwoHanded(itemsAt(*cbl.first))) {
+-    // If we match the primary slot and the primary slot is not a two handed
+-    // item, then just swap the two slots.
+-    swap(cbl.first, cbl.second);
+-  } else {
+-    cbl.second = slot;
+-    // If the primary slot was two handed, it is no longer valid so clear it.
+-    if (cbl.first && itemSafeTwoHanded(itemsAt(*cbl.first)))
+-      cbl.first = {};
+-  }
+-}
+-
+-void PlayerInventory::addToCustomBar(InventorySlot slot) {
+-  for (size_t j = 0; j < m_customBar.size(1); ++j) {
+-    auto& cbl = m_customBar.at(m_customBarGroup, j);
+-    if (!cbl.first && !cbl.second) {
+-      cbl.first.set(slot);
+-      break;
+-    }
+-  }
+-}
+-
+-uint8_t PlayerInventory::customBarGroup() const {
+-  return m_customBarGroup;
+-}
+-
+-void PlayerInventory::setCustomBarGroup(uint8_t group) {
+-  m_customBarGroup = group;
+-}
+-
+-uint8_t PlayerInventory::customBarGroups() const {
+-  return m_customBar.size(0);
+-}
+-
+-uint8_t PlayerInventory::customBarIndexes() const {
+-  return m_customBar.size(1);
+-}
+-
+-SelectedActionBarLocation PlayerInventory::selectedActionBarLocation() const {
+-  return m_selectedActionBar;
+-}
+-
+-void PlayerInventory::selectActionBarLocation(SelectedActionBarLocation location) {
+-  m_selectedActionBar = location;
+-}
+-
+-ItemPtr PlayerInventory::primaryHeldItem() const {
+-  if (m_swapSlot)
+-    return m_swapSlot;
+-
+-  if (m_selectedActionBar.is<EssentialItem>())
+-    return m_essential.value(m_selectedActionBar.get<EssentialItem>());
+-
+-  if (m_selectedActionBar.is<CustomBarIndex>()) {
+-    if (auto slot = m_customBar.at(m_customBarGroup, m_selectedActionBar.get<CustomBarIndex>()).first)
+-      return itemsAt(*slot);
+-  }
+-
+-  return {};
+-}
+-
+-ItemPtr PlayerInventory::secondaryHeldItem() const {
+-  auto pri = primaryHeldItem();
+-  if (itemSafeTwoHanded(pri) || m_swapSlot || !m_selectedActionBar || m_selectedActionBar.is<EssentialItem>())
+-    return {};
+-
+-  auto const& cbl = m_customBar.at(m_customBarGroup, m_selectedActionBar.get<CustomBarIndex>());
+-
+-  if (cbl.first && itemSafeTwoHanded(itemsAt(*cbl.first)))
+-    return {};
+-
+-  if (cbl.second)
+-    return itemsAt(*cbl.second);
+-
+-  return {};
+-}
+-
+-Maybe<InventorySlot> PlayerInventory::primaryHeldSlot() const {
+-  if (m_swapSlot)
+-    return InventorySlot(SwapSlot());
+-  if (m_selectedActionBar.is<CustomBarIndex>())
+-    return customBarPrimarySlot(m_selectedActionBar.get<CustomBarIndex>());
+-  return {};
+-}
+-
+-Maybe<InventorySlot> PlayerInventory::secondaryHeldSlot() const {
+-  if (m_swapSlot || itemSafeTwoHanded(primaryHeldItem()))
+-    return {};
+-  if (m_selectedActionBar.is<CustomBarIndex>())
+-    return customBarSecondarySlot(m_selectedActionBar.get<CustomBarIndex>());
+-  return {};
+-}
+-
+-List<ItemPtr> PlayerInventory::pullOverflow() {
+-  return std::move(m_inventoryLoadOverflow);
+-}
+-
+-bool PlayerInventory::equipmentVisibility(EquipmentSlot slot) const {
+-  return (m_equipmentVisibilityMask >> (uint8_t)slot) & 0x1;
+-}
+-
+-void PlayerInventory::setEquipmentVisibility(EquipmentSlot slot, bool visible) {
+-  if (visible)
+-    m_equipmentVisibilityMask |= (1 << (uint8_t)slot);
+-  else
+-    m_equipmentVisibilityMask &= ~(1 << (uint8_t)slot);
+-}
+-
+-void PlayerInventory::load(Json const& store) {
+-  auto itemDatabase = Root::singleton().itemDatabase();
+-
+-  for (auto slot : EquipmentSlotNames) {
+-    auto jItem = store.get(strf("{}Slot", slot.second), Json());
+-    m_equipment[slot.first] = itemDatabase->diskLoad(jItem);
+-  }
+-
+-  //reuse ItemBags so the Inventory pane still works after load()'ing into the same PlayerInventory again (from swap)
+-  auto itemBags = store.get("itemBags").toObject();
+-  m_inventoryLoadOverflow.clear();
+-  for (auto const& p : itemBags) {
+-    auto& bagType = p.first;
+-    auto newBag = ItemBag::loadStore(p.second);
+-    if (m_bags.contains(bagType)) {
+-      auto& bag = m_bags.at(bagType);
+-      m_inventoryLoadOverflow.appendAll(newBag.resize(bag->size()));
+-      *bag = std::move(newBag);
+-    } else {
+-      m_inventoryLoadOverflow.appendAll(newBag.items());
+-    }
+-  }
+-
+-  m_swapSlot = itemDatabase->diskLoad(store.get("swapSlot"));
+-  m_trashSlot = itemDatabase->diskLoad(store.get("trashSlot"));
+-
+-  m_currencies = jsonToMapV<StringMap<uint64_t>>(store.get("currencies"), mem_fn(&Json::toUInt));
+-
+-  m_customBarGroup = store.getUInt("customBarGroup");
+-
+-  for (size_t i = 0; i < m_customBar.size(0); ++i) {
+-    for (size_t j = 0; j < m_customBar.size(1); ++j) {
+-      Json cbl = store.get("customBar").get(i, JsonArray()).get(j, JsonArray());
+-      auto validateLink = [this](Maybe<InventorySlot> link) -> Maybe<InventorySlot> {
+-        if (link && link->is<BagSlot>()) {
+-          auto& slot = link->get<BagSlot>();
+-          if (m_bags.contains(slot.first) && size_t(slot.second) < m_bags[slot.first]->size())
+-            return link;
+-          else
+-            return {};
+-        }
+-        return link;
+-      };
+-      m_customBar.at(i, j) = CustomBarLink{
+-        validateLink(jsonToMaybe<InventorySlot>(cbl.get(0, {}), jsonToInventorySlot)),
+-        validateLink(jsonToMaybe<InventorySlot>(cbl.get(1, {}), jsonToInventorySlot))
+-      };
+-    }
+-  }
+-
+-  m_selectedActionBar = jsonToSelectedActionBarLocation(store.get("selectedActionBar"));
+-
+-  m_essential.clear();
+-  m_essential[EssentialItem::BeamAxe] = itemDatabase->diskLoad(store.get("beamAxe"));
+-  m_essential[EssentialItem::WireTool] = itemDatabase->diskLoad(store.get("wireTool"));
+-  m_essential[EssentialItem::PaintTool] = itemDatabase->diskLoad(store.get("paintTool"));
+-  m_essential[EssentialItem::InspectionTool] = itemDatabase->diskLoad(store.get("inspectionTool"));
+-
+-  m_equipmentVisibilityMask = (unsigned)store.optUInt("equipmentVisibilityMask").value(0xFFFFFFFF);
+-}
+-
+-Json PlayerInventory::store() const {
+-  auto itemDatabase = Root::singleton().itemDatabase();
+-
+-  JsonArray customBar;
+-  for (size_t i = 0; i < m_customBar.size(0); ++i) {
+-    JsonArray customBarGroup;
+-    for (size_t j = 0; j < m_customBar.size(1); ++j) {
+-      auto const& cbl  = m_customBar.at(i, j);
+-      customBarGroup.append(JsonArray{jsonFromMaybe(cbl.first, jsonFromInventorySlot), jsonFromMaybe(cbl.second, jsonFromInventorySlot)});
+-    }
+-    customBar.append(take(customBarGroup));
+-  }
+-
+-  JsonObject itemBags;
+-  for (auto& bag : m_bags)
+-    itemBags.add(bag.first, bag.second->diskStore());
+-
+-  auto data = JsonObject{
+-    {"itemBags", itemBags},
+-    {"swapSlot", itemDatabase->diskStore(m_swapSlot)},
+-    {"trashSlot", itemDatabase->diskStore(m_trashSlot)},
+-    {"currencies", jsonFromMap(m_currencies)},
+-    {"customBarGroup", m_customBarGroup},
+-    {"customBar", std::move(customBar)},
+-    {"selectedActionBar", jsonFromSelectedActionBarLocation(m_selectedActionBar)},
+-    {"beamAxe", itemDatabase->diskStore(m_essential.value(EssentialItem::BeamAxe))},
+-    {"wireTool", itemDatabase->diskStore(m_essential.value(EssentialItem::WireTool))},
+-    {"paintTool", itemDatabase->diskStore(m_essential.value(EssentialItem::PaintTool))},
+-    {"inspectionTool", itemDatabase->diskStore(m_essential.value(EssentialItem::InspectionTool))}
+-  };
+-
+-  for (auto& equipment : m_equipment) {
+-    if (equipment.first <= EquipmentSlot::BackCosmetic || equipment.second)
+-      data.set(strf("{}Slot", EquipmentSlotNames.getRight(equipment.first)), itemDatabase->diskStore(equipment.second));
+-  }
+-
+-  data.set("equipmentVisibilityMask", m_equipmentVisibilityMask);
+-
+-  return data;
+-}
+-
+-void PlayerInventory::forEveryItem(function<void(InventorySlot const&, ItemPtr&)> function) {
+-  auto checkedFunction = [function = std::move(function)](InventorySlot const& slot, ItemPtr& item) {
+-    if (item)
+-      function(slot, item);
+-  };
+-
+-  for (auto& p : m_equipment)
+-    checkedFunction(p.first, p.second);
+-  for (auto const& p : m_bags) {
+-    for (size_t i = 0; i < p.second->size(); ++i)
+-      checkedFunction(BagSlot(p.first, i), p.second->at(i));
+-  }
+-  checkedFunction(SwapSlot(), m_swapSlot);
+-  checkedFunction(TrashSlot(), m_trashSlot);
+-}
+-
+-void PlayerInventory::forEveryItem(function<void(InventorySlot const&, ItemPtr const&)> function) const {
+-  return const_cast<PlayerInventory*>(this)->forEveryItem([function = std::move(function)](InventorySlot const& slot, ItemPtr& item) {
+-      function(slot, item);
+-    });
+-}
+-
+-List<ItemPtr> PlayerInventory::allItems() const {
+-  List<ItemPtr> items;
+-  forEveryItem([&items](InventorySlot const&, ItemPtr const& item) {
+-      items.append(item);
+-    });
+-  return items;
+-}
+-
+-Map<String, uint64_t> PlayerInventory::itemSummary() const {
+-  Map<String, uint64_t> result;
+-  forEveryItem([&result](auto const&, auto const& item) {
+-      result[item->name()] += item->count();
+-    });
+-  return result;
+-}
+-
+-void PlayerInventory::cleanup() {
+-  for (auto pair : m_bags)
+-    pair.second->cleanup();
+-
+-  for (auto& p : m_equipment)
+-    if (p.second && p.second->empty())
+-      p.second = ItemPtr();
+-
+-  if (m_swapSlot && m_swapSlot->empty())
+-    m_swapSlot = ItemPtr();
+-
+-  if (m_trashSlot && m_trashSlot->empty())
+-    m_trashSlot = ItemPtr();
+-
+-  m_customBar.forEach([this](Array2S const&, CustomBarLink& p) {
+-      ItemPtr primary = p.first ? retrieve(*p.first) : ItemPtr();
+-      ItemPtr secondary = p.second ? retrieve(*p.second) : ItemPtr();
+-
+-      // Reset the primary and secondary action bar link if the item is gone
+-      if (!primary)
+-        p.first.reset();
+-      if (!secondary)
+-        p.second.reset();
+-
+-      // If the primary hand item is two handed, the secondary hand should not be
+-      // set
+-      if (itemSafeTwoHanded(primary))
+-        p.second.reset();
+-      // Two handed items are not allowed in the secondary slot
+-      if (itemSafeTwoHanded(secondary))
+-        p.second.reset();
+-    });
+-}
+-
+-void PlayerInventory::setPlayer(Player* player) {
+-  m_player = player;
+-}
+-
+-PlayerInventory const& PlayerInventory::blankInventory() {
+-  static thread_local auto inventory = std::make_shared<PlayerInventory>();
+-  return *inventory;
+-}
+-
+-void PlayerInventory::netStore(DataStream& ds, NetCompatibilityRules rules) const {
+-  if (m_player && !m_player->isMaster() && !rules.isAdmin())
+-    return blankInventory().netStore(ds, rules);
+-  else
+-    return NetElementSyncGroup::netStore(ds, rules);
+-}
+-
+-
+-bool PlayerInventory::writeNetDelta(DataStream& ds, uint64_t fromVersion, NetCompatibilityRules rules) const {
+-  if (m_player && !m_player->isMaster() && !rules.isAdmin())
+-    return blankInventory().writeNetDelta(ds, fromVersion, rules);
+-  else
+-    return NetElementSyncGroup::writeNetDelta(ds, fromVersion, rules);
+-}
+-
+-bool PlayerInventory::checkInventoryFilter(ItemPtr const& items, String const& filterName) {
+-  Json filterConfig;
+-
+-  auto itemFilters = items->instanceValue("inventoryFilters");
+-  if (itemFilters.isType(Json::Type::Object)) {
+-    filterConfig = itemFilters.opt(filterName).value();
+-    if (!filterConfig.isType(Json::Type::Object))
+-      filterConfig = itemFilters.opt("default").value();
+-  }
+-
+-  if (!filterConfig.isType(Json::Type::Object)) {
+-    auto config = Root::singleton().assets()->json("/player.config:inventoryFilters");
+-    filterConfig = config.opt(filterName).value();
+-    if (!filterConfig.isType(Json::Type::Object))
+-      filterConfig = config.get("default", JsonObject());
+-  }
+-
+-  // filter by item type if an itemTypes filter is set
+-  auto itemDatabase = Root::singleton().itemDatabase();
+-  auto itemTypeName = ItemTypeNames.getRight(itemDatabase->itemType(items->name()));
+-  if (filterConfig.contains("typeWhitelist") && !filterConfig.getArray("typeWhitelist").contains(itemTypeName))
+-    return false;
+-
+-  if (filterConfig.contains("typeBlacklist") && filterConfig.getArray("typeBlacklist").contains(itemTypeName))
+-    return false;
+-
+-  // filter by item tags if an itemTags filter is set
+-  // this is an inclusive filter
+-  auto itemTags = itemDatabase->itemTags(items->name());
+-  if (filterConfig.contains("tagWhitelist")) {
+-    auto whitelistedTags = filterConfig.getArray("tagWhitelist").filtered([itemTags](Json const& tag) {
+-        return itemTags.contains(tag.toString());
+-      });
+-    if (whitelistedTags.size() == 0)
+-      return false;
+-  }
+-
+-  if (filterConfig.contains("tagBlacklist")) {
+-    auto blacklistedTags = filterConfig.getArray("tagBlacklist").filtered([itemTags](Json const& tag) {
+-        return itemTags.contains(tag.toString());
+-      });
+-    if (blacklistedTags.size() > 0)
+-      return false;
+-  }
+-
+-  auto itemCategory = items->category();
+-  if (auto categoryWhitelist = filterConfig.optArray("categoryWhitelist")) {
+-    auto categoryWhiteset = jsonToStringSet(*categoryWhitelist);
+-    if (!categoryWhiteset.contains(itemCategory))
+-      return false;
+-  }
+-
+-  if (auto categoryBlacklist = filterConfig.optArray("categoryBlacklist")) {
+-    auto categoryBlackset = jsonToStringSet(*categoryBlacklist);
+-    if (categoryBlackset.contains(itemCategory))
+-      return false;
+-  }
+-
+-  return true;
+-}
+-
+-ItemPtr const& PlayerInventory::retrieve(InventorySlot const& slot) const {
+-  return const_cast<PlayerInventory*>(this)->retrieve(slot);
+-}
+-
+-ItemPtr& PlayerInventory::retrieve(InventorySlot const& slot) {
+-  auto guardEmpty = [](ItemPtr& item) -> ItemPtr& {
+-    if (item && item->empty())
+-      item = {};
+-    return item;
+-  };
+-
+-  if (auto es = slot.ptr<EquipmentSlot>())
+-    return guardEmpty(m_equipment[*es]);
+-  else if (auto bs = slot.ptr<BagSlot>()) {
+-    if (auto bag = m_bags.ptr(bs->first))
+-      return guardEmpty((*bag)->at(bs->second));
+-  } else if (slot.is<SwapSlot>())
+-    return guardEmpty(m_swapSlot);
+-  else
+-    return guardEmpty(m_trashSlot);
+-
+-  throw ItemException::format("Invalid inventory slot {}", jsonFromInventorySlot(slot));
+-}
+-
+-void PlayerInventory::swapCustomBarLinks(InventorySlot a, InventorySlot b) {
+-  m_customBar.forEach([&](Array2S const&, CustomBarLink& p) {
+-      if (p.first == a)
+-        p.first = b;
+-      else if (p.first == b)
+-        p.first = a;
+-
+-      if (p.second == a)
+-        p.second = b;
+-      else if (p.second == b)
+-        p.second = a;
+-    });
+-}
+-
+-void PlayerInventory::autoAddToCustomBar(InventorySlot slot) {
+-  if (!Root::singleton().configuration()->getPath("inventory.pickupToActionBar").toBool())
+-    return;
+-
+-  auto items = itemsAt(slot);
+-  if (items && !items->empty() && checkInventoryFilter(items, "autoAddToCustomBar"))
+-    addToCustomBar(slot);
+-}
+-
+-void PlayerInventory::netElementsNeedLoad(bool) {
+-  auto itemDatabase = Root::singleton().itemDatabase();
+-
+-  auto deserializeItem = [&itemDatabase](NetElementData<ItemDescriptor>& netState, ItemPtr& item) {
+-    if (netState.pullUpdated())
+-      itemDatabase->loadItem(netState.get(), item);
+-  };
+-
+-  auto deserializeItemList = [&](List<NetElementData<ItemDescriptor>>& netStatesList, List<ItemPtr>& itemList) {
+-    for (size_t i = 0; i < netStatesList.size(); ++i)
+-      deserializeItem(netStatesList[i], itemList[i]);
+-  };
+-
+-  auto deserializeItemMap = [&](auto& netStatesMap, auto& itemMap) {
+-    for (auto k : netStatesMap.keys())
+-      deserializeItem(netStatesMap[k], itemMap[k]);
+-  };
+-
+-  deserializeItemMap(m_equipmentNetState, m_equipment);
+-
+-  for (auto bagType : m_bagsNetState.keys())
+-    deserializeItemList(m_bagsNetState[bagType], m_bags[bagType]->items());
+-
+-  deserializeItem(m_swapSlotNetState, m_swapSlot);
+-  deserializeItem(m_trashSlotNetState, m_trashSlot);
+-
+-  m_currencies = m_currenciesNetState.get();
+-
+-  m_customBarGroup = m_customBarGroupNetState.get();
+-  m_customBarNetState.forEach([&](auto const& index, auto& ns) {
+-      m_customBar.at(index) = ns.get();
+-    });
+-
+-  m_selectedActionBar = m_selectedActionBarNetState.get();
+-
+-  deserializeItemMap(m_essentialNetState, m_essential);
+-
+-  cleanup();
+-}
+-
+-void PlayerInventory::netElementsNeedStore() {
+-  cleanup();
+-
+-  auto serializeItem = [](NetElementData<ItemDescriptor>& netState, ItemPtr& item) {
+-    netState.set(itemSafeDescriptor(item));
+-  };
+-
+-  auto serializeItemList = [&](List<NetElementData<ItemDescriptor>>& netStatesList, List<ItemPtr>& itemList) {
+-    for (size_t i = 0; i < netStatesList.size(); ++i)
+-      serializeItem(netStatesList[i], itemList[i]);
+-  };
+-
+-  auto serializeItemMap = [&](auto& netStatesMap, auto& itemMap) {
+-    for (auto k : netStatesMap.keys())
+-      serializeItem(netStatesMap[k], itemMap[k]);
+-  };
+-
+-  serializeItemMap(m_equipmentNetState, m_equipment);
+-
+-  for (auto bagType : m_bagsNetState.keys())
+-    serializeItemList(m_bagsNetState[bagType], m_bags[bagType]->items());
+-
+-  serializeItem(m_swapSlotNetState, m_swapSlot);
+-  serializeItem(m_trashSlotNetState, m_trashSlot);
+-
+-  m_currenciesNetState.set(m_currencies);
+-
+-  m_customBarGroupNetState.set(m_customBarGroup);
+-  m_customBar.forEach([&](auto const& index, auto& cbl) {
+-      m_customBarNetState.at(index).set(cbl);
+-    });
+-
+-  m_selectedActionBarNetState.set(m_selectedActionBar);
+-
+-  serializeItemMap(m_essentialNetState, m_essential);
+-}
+-
+-}
++#include "StarPlayerInventory.hpp"
++#include "StarRoot.hpp"
++#include "StarCurrency.hpp"
++#include "StarArmors.hpp"
++#include "StarLiquidItem.hpp"
++#include "StarMaterialItem.hpp"
++#include "StarObjectItem.hpp"
++#include "StarItemDatabase.hpp"
++#include "StarPointableItem.hpp"
++#include "StarItemBag.hpp"
++#include "StarAssets.hpp"
++#include "StarJsonExtra.hpp"
++#include "StarLogging.hpp"
++#include "StarPlayer.hpp"
++
++namespace Star {
++
++bool PlayerInventory::itemAllowedInBag(ItemPtr const& items, String const& bagType) {
++  // any inventory type can have empty slots
++  if (!items)
++    return true;
++
++  return checkInventoryFilter(items, bagType);
++}
++
++bool PlayerInventory::itemAllowedAsEquipment(ItemPtr const& item, EquipmentSlot equipmentSlot) {
++  // any equipment slot can be empty
++  if (!item)
++    return true;
++
++  if (equipmentSlot == EquipmentSlot::Head || equipmentSlot == EquipmentSlot::HeadCosmetic)
++    return is<HeadArmor>(item);
++  else if (equipmentSlot == EquipmentSlot::Chest || equipmentSlot == EquipmentSlot::ChestCosmetic)
++    return is<ChestArmor>(item);
++  else if (equipmentSlot == EquipmentSlot::Legs || equipmentSlot == EquipmentSlot::LegsCosmetic)
++    return is<LegsArmor>(item);
++  else if (equipmentSlot == EquipmentSlot::Back || equipmentSlot == EquipmentSlot::BackCosmetic)
++    return is<BackArmor>(item);
++  else
++    return is<ArmorItem>(item);
++}
++
++PlayerInventory::PlayerInventory() {
++  auto config = Root::singleton().assets()->json("/player.config:inventory");
++
++  auto bags = config.get("itemBags");
++  auto bagOrder = bags.toObject().keys().sorted([&bags](String const& a, String const& b) {
++    return bags.get(a).getInt("priority", 0) < bags.get(b).getInt("priority", 0);
++  });
++  for (auto name : bagOrder) {
++    size_t size = bags.get(name).getUInt("size");
++    m_bags[name] = make_shared<ItemBag>(size);
++    m_bagsNetState[name].resize(size);
++  }
++
++  auto currenciesConfig = Root::singleton().assets()->json("/currencies.config");
++  for (auto p : currenciesConfig.iterateObject())
++    m_currencies[p.first] = 0;
++
++  size_t customBarGroups = config.getUInt("customBarGroups");
++  size_t customBarIndexes = config.getUInt("customBarIndexes");
++  m_customBarGroup = 0;
++  m_customBar.resize(customBarGroups, customBarIndexes);
++
++  for (auto slot : EquipmentSlotNames) {
++    auto& element = m_equipmentNetState[slot.first];
++    if (slot.first > EquipmentSlot::BackCosmetic)
++      element.setCompatibilityVersion(9);
++    addNetElement(&element);
++  }
++
++  for (auto& p : m_bagsNetState) {
++    for (auto& e : p.second)
++      addNetElement(&e);
++  }
++
++  addNetElement(&m_swapSlotNetState);
++  addNetElement(&m_trashSlotNetState);
++
++  addNetElement(&m_currenciesNetState);
++
++  addNetElement(&m_customBarGroupNetState);
++  m_customBarNetState.resize(customBarGroups, customBarIndexes);
++  m_customBarNetState.forEach([this](Array2S const&, NetElementData<CustomBarLink>& e) {
++      addNetElement(&e);
++    });
++
++  addNetElement(&m_selectedActionBarNetState);
++
++  addNetElement(&m_essentialNetState[EssentialItem::BeamAxe]);
++  addNetElement(&m_essentialNetState[EssentialItem::WireTool]);
++  addNetElement(&m_essentialNetState[EssentialItem::PaintTool]);
++  addNetElement(&m_essentialNetState[EssentialItem::InspectionTool]);
++
++  m_equipmentVisibilityMask = 0xFFFFFFFF;
++  m_player = nullptr;
++}
++
++ItemPtr PlayerInventory::itemsAt(InventorySlot const& slot) const {
++  return retrieve(slot);
++}
++
++ItemPtr PlayerInventory::stackWith(InventorySlot const& slot, ItemPtr const& items) {
++  if (!items || items->empty())
++    return {};
++
++  if (auto es = slot.ptr<EquipmentSlot>()) {
++    auto& itemSlot = retrieve(slot);
++    if (!itemSlot && itemAllowedAsEquipment(items, *es))
++      m_equipment[*es] = items->take(1);
++  } else {
++    auto& dest = retrieve(slot);
++    if (dest && dest->stackableWith(items))
++      dest->stackWith(items);
++    if (!dest)
++      dest = items->take(items->count());
++  }
++
++  if (items->empty())
++    return {};
++
++  return items;
++}
++
++ItemPtr PlayerInventory::takeSlot(InventorySlot const& slot) {
++  if (slot.is<SwapSlot>())
++    m_swapReturnSlot = {};
++  return take(retrieve(slot));
++}
++
++bool PlayerInventory::exchangeItems(InventorySlot const& first, InventorySlot const& second) {
++  auto& firstItems = retrieve(first);
++  auto& secondItems = retrieve(second);
++
++  if (first.is<BagSlot>() && !itemAllowedInBag(secondItems, first.get<BagSlot>().first))
++    return false;
++  if (second.is<BagSlot>() && !itemAllowedInBag(firstItems, second.get<BagSlot>().first))
++    return false;
++  if (first.is<EquipmentSlot>() && (secondItems->count() > 1 || !itemAllowedAsEquipment(secondItems, first.get<EquipmentSlot>())))
++    return false;
++  if (second.is<EquipmentSlot>() && (firstItems->count() > 1 || !itemAllowedAsEquipment(firstItems, second.get<EquipmentSlot>())))
++    return false;
++
++  swap(firstItems, secondItems);
++  swapCustomBarLinks(first, second);
++
++  return true;
++}
++
++bool PlayerInventory::setItem(InventorySlot const& slot, ItemPtr const& item) {
++  if (auto currencyItem = as<CurrencyItem>(item)) {
++    m_currencies[currencyItem->currencyType()] += currencyItem->totalValue();
++    return true;
++  } else if (auto es = slot.ptr<EquipmentSlot>()) {
++    if (itemAllowedAsEquipment(item, *es)) {
++      m_equipment[*es] = item;
++      return true;
++    }
++  } else if (slot.is<SwapSlot>()) {
++    m_swapSlot = item;
++    return true;
++  } else if (slot.is<TrashSlot>()) {
++    m_trashSlot = item;
++    return true;
++  } else {
++    auto bs = slot.get<BagSlot>();
++    if (itemAllowedInBag(item, bs.first)) {
++      m_bags[bs.first]->setItem(bs.second, item);
++      return true;
++    }
++  }
++
++  return false;
++}
++
++bool PlayerInventory::consumeSlot(InventorySlot const& slot, uint64_t count) {
++  if (count == 0)
++    return true;
++
++  auto& item = retrieve(slot);
++  if (!item)
++    return false;
++
++  bool consumed = item->consume(count);
++  if (item->empty())
++    item = {};
++
++  return consumed;
++}
++
++bool PlayerInventory::slotValid(InventorySlot const& slot) const {
++  if (auto bagSlot = slot.ptr<BagSlot>()) {
++    if (auto bag = bagContents(bagSlot->first)) {
++      if ((size_t)bagSlot->second >= bag->size())
++        return false;
++    }
++    else return false;
++  }
++  return true;
++}
++
++ItemPtr PlayerInventory::addItems(ItemPtr items) {
++  if (!items || items->empty())
++    return {};
++
++  // First, add coins as monetary value.
++  if (auto currencyItem = as<CurrencyItem>(items)) {
++    addCurrency(currencyItem->currencyType(), currencyItem->totalValue());
++    return {};
++  }
++
++  // Then, try adding equipment to the equipment slots.
++  if (is<HeadArmor>(items) && !headArmor())
++    m_equipment[EquipmentSlot::Head] = items->take(1);
++  if (is<ChestArmor>(items) && !chestArmor())
++    m_equipment[EquipmentSlot::Chest] = items->take(1);
++  if (is<LegsArmor>(items) && !legsArmor())
++    m_equipment[EquipmentSlot::Legs] = items->take(1);
++  if (is<BackArmor>(items) && !backArmor())
++    m_equipment[EquipmentSlot::Back] = items->take(1);
++
++  if (is<MaterialItem>(items)) {
++    if (auto primary = primaryHeldItem()) {
++      primary->stackWith(items);
++      if (items->empty())
++        return {};
++    }
++  }
++
++  // Then, finally the bags
++  return addToBags(std::move(items));
++}
++
++ItemPtr PlayerInventory::addToBags(ItemPtr items) {
++  if (!items || items->empty())
++    return {};
++
++  for (auto pair : m_bags) {
++    if (!itemAllowedInBag(items, pair.first))
++      continue;
++
++    items = pair.second->stackItems(items);
++    if (!items)
++      break;
++
++    for (unsigned i = 0; i < pair.second->size(); ++i) {
++      if (!pair.second->at(i)) {
++        pair.second->setItem(i, take(items));
++        autoAddToCustomBar(BagSlot(pair.first, i));
++        break;
++      }
++    }
++  }
++
++  return items;
++}
++
++uint64_t PlayerInventory::itemsCanFit(ItemPtr const& items) const {
++  if (!items || items->empty())
++    return 0;
++
++  if (is<CurrencyItem>(items))
++    return items->count();
++
++  uint64_t canFit = 0;
++
++  // First, check the equipment slots
++  if (is<HeadArmor>(items) && !headArmor())
++    ++canFit;
++  if (is<ChestArmor>(items) && !chestArmor())
++    ++canFit;
++  if (is<LegsArmor>(items) && !legsArmor())
++    ++canFit;
++  if (is<BackArmor>(items) && !backArmor())
++    ++canFit;
++
++  // Then add into bags
++  for (auto const& pair : m_bags) {
++    if (itemAllowedInBag(items, pair.first))
++      canFit += pair.second->itemsCanFit(items);
++  }
++
++  return min(canFit, items->count());
++}
++
++bool PlayerInventory::hasItem(ItemDescriptor const& descriptor, bool exactMatch, bool includeVirtual) const {
++  return hasCountOfItem(descriptor, exactMatch, includeVirtual) >= descriptor.count();
++}
++
++uint64_t PlayerInventory::hasCountOfItem(ItemDescriptor const& descriptor, bool exactMatch, bool includeVirtual) const {
++  auto one = descriptor.singular();
++
++  uint64_t count = 0;
++  auto countItem = [&](ItemPtr const& ptr) {
++    if (ptr)
++      count += ptr->matches(one, exactMatch) ? ptr->count() : 0;
++  };
++
++  countItem(m_swapSlot);
++  countItem(m_trashSlot);
++  for (auto const& p : m_equipment)
++    countItem(p.second);
++
++  for (auto const& pair : m_bags)
++    count += pair.second->available(one, exactMatch);
++
++  if (includeVirtual && m_player)
++    count += m_player->virtualInventoryCount(one, exactMatch);
++
++  return count;
++}
++
++bool PlayerInventory::consumeItems(ItemDescriptor const& descriptor, bool exactMatch, bool includeVirtual) {
++  if (descriptor.count() == 0)
++    return true;
++
++  uint64_t realCount = hasCountOfItem(descriptor, exactMatch, false);
++  if (realCount >= descriptor.count())
++    return consumeRealItems(descriptor, exactMatch);
++
++  if (!includeVirtual || !m_player)
++    return false;
++
++  uint64_t virtualNeeded = descriptor.count() - realCount;
++  if (m_player->virtualInventoryCount(descriptor.singular(), exactMatch) < virtualNeeded)
++    return false;
++
++  if (realCount > 0)
++    consumeRealItems(descriptor.withCount(realCount), exactMatch);
++
++  uint64_t consumed = m_player->virtualInventoryConsume(descriptor.withCount(virtualNeeded), exactMatch);
++  if (consumed < virtualNeeded) {
++    Logger::warn("PlayerInventory: virtual inventory consumed {} of {} '{}'", consumed, virtualNeeded, descriptor.name());
++    return false;
++  }
++  return true;
++}
++
++bool PlayerInventory::consumeRealItems(ItemDescriptor const& descriptor, bool exactMatch) {
++  if (descriptor.count() == 0)
++    return true;
++
++  auto one = descriptor.singular();
++
++  Map<String, uint64_t> consumeFromItemBags;
++  for (auto pair : m_bags)
++    consumeFromItemBags[pair.first] = pair.second->available(one);
++
++  uint64_t consumeFromEquipment = 0;
++  for (auto const& p : m_equipment) {
++    if (p.second)
++      consumeFromEquipment += p.second->matches(one, exactMatch) ? p.second->count() : 0;
++  }
++
++  uint64_t consumeFromSwap = 0;
++  if (m_swapSlot)
++    consumeFromSwap += m_swapSlot->matches(one, exactMatch) ? m_swapSlot->count() : 0;
++
++  uint64_t consumeFromTrash = 0;
++  if (m_trashSlot)
++    consumeFromTrash += m_trashSlot->matches(one, exactMatch) ? m_trashSlot->count() : 0;
++
++  auto totalAvailable = consumeFromEquipment + consumeFromSwap + consumeFromTrash;
++  for (auto pair : consumeFromItemBags)
++    totalAvailable += pair.second;
++
++  if (totalAvailable < descriptor.count())
++    return false;
++
++  uint64_t leftoverCount = descriptor.count();
++  uint64_t quantity;
++  for (auto pair : m_bags) {
++    quantity = min(leftoverCount, consumeFromItemBags[pair.first]);
++    if (quantity > 0) {
++      auto res = pair.second->consumeItems(one.multiply(quantity), exactMatch);
++      _unused(res);
++      starAssert(res);
++      leftoverCount -= quantity;
++    }
++  }
++
++  quantity = min(leftoverCount, consumeFromEquipment);
++  if (quantity > 0) {
++    auto leftoverQuantity = quantity;
++    _unused(leftoverQuantity);
++    for (auto const& p : m_equipment) {
++      if (p.second && p.second->matches(one, exactMatch)) {
++        auto toConsume = min(p.second->count(), quantity);
++        auto res = p.second->consume(toConsume);
++        _unused(res);
++        starAssert(res);
++
++        leftoverQuantity -= toConsume;
++      }
++    }
++    starAssert(leftoverQuantity == 0);
++    leftoverCount -= quantity;
++  }
++
++  quantity = std::min(leftoverCount, consumeFromSwap);
++  if (quantity > 0) {
++    if (m_swapSlot && m_swapSlot->matches(one, exactMatch)) {
++      auto toConsume = std::min(m_swapSlot->count(), quantity);
++      auto res = m_swapSlot->consume(toConsume);
++      _unused(res);
++      starAssert(res);
++
++      quantity -= toConsume;
++      starAssert(quantity == 0);
++    }
++    leftoverCount -= std::min(leftoverCount, consumeFromSwap);
++  }
++
++  quantity = std::min(leftoverCount, consumeFromTrash);
++  if (quantity > 0) {
++    if (m_trashSlot && m_trashSlot->matches(one, exactMatch)) {
++      auto toConsume = std::min(m_trashSlot->count(), quantity);
++      auto res = m_trashSlot->consume(toConsume);
++      _unused(res);
++      starAssert(res);
++
++      quantity -= toConsume;
++      starAssert(quantity == 0);
++    }
++    leftoverCount -= std::min(leftoverCount, consumeFromTrash);
++  }
++
++  starAssert(leftoverCount == 0);
++  return true;
++}
++
++ItemDescriptor PlayerInventory::takeItems(ItemDescriptor const& descriptor, bool takePartial, bool exactMatch, bool includeVirtual) {
++  uint64_t hasCount = hasCountOfItem(descriptor, exactMatch, includeVirtual);
++
++  if (hasCount >= descriptor.count() || (takePartial && hasCount > 0)) {
++    ItemDescriptor consumeDescriptor = descriptor.withCount(min(descriptor.count(), hasCount));
++    if (consumeItems(consumeDescriptor, exactMatch, includeVirtual))
++      return consumeDescriptor;
++  }
++
++  return {};
++}
++
++HashMap<ItemDescriptor, uint64_t> PlayerInventory::availableItems(bool includeVirtual) const {
++  auto normalizedBag = ItemDatabase::normalizeBag(allItems());
++  if (includeVirtual && m_player) {
++    for (auto const& descriptor : m_player->virtualInventoryItems()) {
++      if (descriptor.count() > 0)
++        normalizedBag[ItemDescriptor(descriptor.name(), 1)] += descriptor.count();
++    }
++  }
++  return normalizedBag;
++}
++
++HeadArmorPtr PlayerInventory::headArmor() const {
++  return as<HeadArmor>(m_equipment.value(EquipmentSlot::Head));
++}
++
++ChestArmorPtr PlayerInventory::chestArmor() const {
++  return as<ChestArmor>(m_equipment.value(EquipmentSlot::Chest));
++}
++
++LegsArmorPtr PlayerInventory::legsArmor() const {
++  return as<LegsArmor>(m_equipment.value(EquipmentSlot::Legs));
++}
++
++BackArmorPtr PlayerInventory::backArmor() const {
++  return as<BackArmor>(m_equipment.value(EquipmentSlot::Back));
++}
++
++HeadArmorPtr PlayerInventory::headCosmetic() const {
++  return as<HeadArmor>(m_equipment.value(EquipmentSlot::HeadCosmetic));
++}
++
++ChestArmorPtr PlayerInventory::chestCosmetic() const {
++  return as<ChestArmor>(m_equipment.value(EquipmentSlot::ChestCosmetic));
++}
++
++LegsArmorPtr PlayerInventory::legsCosmetic() const {
++  return as<LegsArmor>(m_equipment.value(EquipmentSlot::LegsCosmetic));
++}
++
++BackArmorPtr PlayerInventory::backCosmetic() const {
++  return as<BackArmor>(m_equipment.value(EquipmentSlot::BackCosmetic));
++}
++
++ArmorItemPtr PlayerInventory::equipment(EquipmentSlot slot, bool testMask) const {
++  if (testMask && !equipmentVisibility(slot))
++    return {};
++
++  if (auto item = m_equipment.ptr(slot))
++    if (auto armor = as<ArmorItem>(*item))
++      return armor;
++
++  return {};
++}
++
++ItemBagConstPtr PlayerInventory::bagContents(String const& type) const {
++  if (!m_bags.contains(type)) return nullptr;
++  return m_bags.get(type);
++}
++
++void PlayerInventory::condenseBagStacks(String const& bagType) {
++  auto bag = m_bags[bagType];
++
++  bag->condenseStacks();
++
++  m_customBar.forEach([&](auto const&, CustomBarLink& link) {
++      if (link.first) {
++        if (auto bs = link.first->ptr<BagSlot>()) {
++          if (bs->first == bagType && !bag->at(bs->second))
++            link.first = {};
++        }
++      }
++      if (link.second) {
++        if (auto bs = link.second->ptr<BagSlot>()) {
++          if (bs->first == bagType && !bag->at(bs->second))
++            link.second = {};
++        }
++      }
++    });
++}
++
++void PlayerInventory::sortBag(String const& bagType) {
++  auto bag = m_bags[bagType];
++
++  // When sorting bags, we need to record where all the action bar links were
++  // pointing if any of them were pointing to the bag we are about to sort.
++  MultiArray<pair<ItemPtr, ItemPtr>, 2> savedCustomBar(m_customBar.size());
++  m_customBar.forEach([&](auto const& index, CustomBarLink const& link) {
++      if (link.first) {
++        if (auto bs = link.first->ptr<BagSlot>()) {
++          if (bs->first == bagType)
++            savedCustomBar(index).first = bag->at(bs->second);
++        }
++      }
++      if (link.second) {
++        if (auto bs = link.second->ptr<BagSlot>()) {
++          if (bs->first == bagType)
++            savedCustomBar(index).second = bag->at(bs->second);
++        }
++      }
++    });
++
++  auto itemDatabase = Root::singletonPtr()->itemDatabase();
++  bag->items().sort([itemDatabase](ItemPtr const& a, ItemPtr const& b) {
++      if (a && !b)
++        return true;
++      if (!a)
++        return false;
++
++      auto aType = itemDatabase->itemType(a->name());
++      auto bType = itemDatabase->itemType(b->name());
++      if (aType != bType)
++        return aType < bType;
++
++      if (a->rarity() != b->rarity())
++        return a->rarity() > b->rarity();
++
++      if (a->name().compare(b->name()) != 0)
++        return a->name().compare(b->name()) < 0;
++
++      if (a->count() != b->count())
++        return a->count() > b->count();
++
++      return false;
++    });
++
++  // Once we are done sorting, we need to restore the potentially action bar
++  // links to point to where the item with the same identity is now residing.
++
++  Map<ItemPtr, size_t> itemIndexes;
++  for (size_t i = 0; i < bag->size(); ++i) {
++    if (auto item = bag->at(i))
++      itemIndexes[item] = i;
++  }
++
++  savedCustomBar.forEach([&](auto const& index, auto const& savedItems) {
++      if (savedItems.first)
++        m_customBar.at(index).first.set(BagSlot(bagType, itemIndexes.get(savedItems.first)));
++      if (savedItems.second)
++        m_customBar.at(index).second.set(BagSlot(bagType, itemIndexes.get(savedItems.second)));
++    });
++}
++
++void PlayerInventory::shiftSwap(InventorySlot const& slot) {
++  if (auto es = slot.ptr<EquipmentSlot>()) {
++    if (itemAllowedAsEquipment(m_swapSlot, *es)) {
++      auto& equipSlot = m_equipment[*es];
++      if (itemSafeCount(m_swapSlot) <= 1) {
++        swap(m_swapSlot, equipSlot);
++        swapCustomBarLinks(SwapSlot(), slot);
++      } else if (itemSafeCount(equipSlot) == 0) {
++        equipSlot = m_swapSlot->take(1);
++      }
++    }
++  } else if (slot.is<TrashSlot>()) {
++    swap(m_swapSlot, m_trashSlot);
++    swapCustomBarLinks(SwapSlot(), slot);
++  } else if (auto bs = slot.ptr<BagSlot>()) {
++    if (itemAllowedInBag(m_swapSlot, bs->first)) {
++      m_swapSlot = m_bags[bs->first]->swapItems(bs->second, m_swapSlot);
++      swapCustomBarLinks(SwapSlot(), slot);
++    }
++  }
++
++  if (!m_swapSlot)
++    m_swapReturnSlot = {};
++  else
++    m_swapReturnSlot = slot;
++}
++
++bool PlayerInventory::clearSwap() {
++  auto trySlot = [&](InventorySlot slot) {
++    if (!m_swapSlot)
++      return;
++
++    m_swapSlot = stackWith(slot, m_swapSlot);
++    if (!m_swapSlot)
++      swapCustomBarLinks(SwapSlot(), slot);
++  };
++
++  auto tryBag = [&](String const& bagType) {
++    for (unsigned i = 0; i < m_bags[bagType]->size(); ++i) {
++      if (!m_swapSlot || !itemAllowedInBag(m_swapSlot, bagType))
++        break;
++      trySlot(BagSlot(bagType, i));
++    }
++  };
++
++  if (m_swapReturnSlot)
++    trySlot(m_swapReturnSlot.take());
++
++  trySlot(EquipmentSlot::Head);
++  trySlot(EquipmentSlot::Chest);
++  trySlot(EquipmentSlot::Legs);
++  trySlot(EquipmentSlot::Back);
++
++  for (auto bagType : m_bags.keys())
++    tryBag(bagType);
++
++  return !m_swapSlot;
++}
++
++ItemPtr PlayerInventory::swapSlotItem() const {
++  return m_swapSlot;
++}
++
++void PlayerInventory::setSwapSlotItem(ItemPtr const& items) {
++  if (auto currencyItem = as<CurrencyItem>(items)) {
++    addCurrency(currencyItem->currencyType(), currencyItem->totalValue());
++    m_swapSlot = {};
++  } else {
++    m_swapSlot = items;
++    autoAddToCustomBar(SwapSlot());
++  }
++}
++
++ItemPtr PlayerInventory::essentialItem(EssentialItem essentialItem) const {
++  return m_essential.value(essentialItem);
++}
++
++void PlayerInventory::setEssentialItem(EssentialItem essentialItem, ItemPtr item) {
++  m_essential[essentialItem] = item;
++}
++
++StringMap<uint64_t> PlayerInventory::availableCurrencies() const {
++  return m_currencies;
++}
++
++uint64_t PlayerInventory::currency(String const& currencyType) const {
++  return m_currencies.value(currencyType, 0);
++}
++
++void PlayerInventory::addCurrency(String const& currencyType, uint64_t amount) {
++  uint64_t previousTotal = m_currencies[currencyType];
++  uint64_t newTotal = previousTotal + amount;
++  if (newTotal < previousTotal)
++    newTotal = highest<uint64_t>();
++  m_currencies[currencyType] = min(Root::singleton().assets()->json("/currencies.config").get(currencyType).getUInt("playerMax", highest<uint64_t>()), newTotal);
++}
++
++bool PlayerInventory::consumeCurrency(String const& currencyType, uint64_t amount) {
++  if (m_currencies[currencyType] >= amount) {
++    m_currencies[currencyType] -= amount;
++    return true;
++  } else {
++    return false;
++  }
++}
++
++Maybe<InventorySlot> PlayerInventory::customBarPrimarySlot(CustomBarIndex customBarIndex) const {
++  return m_customBar.at(m_customBarGroup, customBarIndex).first;
++}
++
++Maybe<InventorySlot> PlayerInventory::customBarSecondarySlot(CustomBarIndex customBarIndex) const {
++  return m_customBar.at(m_customBarGroup, customBarIndex).second;
++}
++
++void PlayerInventory::setCustomBarPrimarySlot(CustomBarIndex customBarIndex, Maybe<InventorySlot> slot) {
++  // The primary slot is not allowed to point to an empty item.
++  if (slot) {
++    if (!itemsAt(*slot))
++      slot = {};
++  }
++
++  auto& cbl = m_customBar.at(m_customBarGroup, customBarIndex);
++  if (slot && cbl.second == slot) {
++    // If we match the secondary slot, just swap the slots for primary and
++    // secondary
++    swap(cbl.first, cbl.second);
++  } else {
++    cbl.first = slot;
++  }
++}
++
++void PlayerInventory::setCustomBarSecondarySlot(CustomBarIndex customBarIndex, Maybe<InventorySlot> slot) {
++  auto& cbl = m_customBar.at(m_customBarGroup, customBarIndex);
++  // The secondary slot is not allowed to point to an empty item or a two
++  // handed item.
++  if (slot) {
++    if (!itemsAt(*slot) || itemSafeTwoHanded(itemsAt(*slot)))
++      slot = {};
++  }
++
++  if (cbl.first && cbl.first == slot && !itemSafeTwoHanded(itemsAt(*cbl.first))) {
++    // If we match the primary slot and the primary slot is not a two handed
++    // item, then just swap the two slots.
++    swap(cbl.first, cbl.second);
++  } else {
++    cbl.second = slot;
++    // If the primary slot was two handed, it is no longer valid so clear it.
++    if (cbl.first && itemSafeTwoHanded(itemsAt(*cbl.first)))
++      cbl.first = {};
++  }
++}
++
++void PlayerInventory::addToCustomBar(InventorySlot slot) {
++  for (size_t j = 0; j < m_customBar.size(1); ++j) {
++    auto& cbl = m_customBar.at(m_customBarGroup, j);
++    if (!cbl.first && !cbl.second) {
++      cbl.first.set(slot);
++      break;
++    }
++  }
++}
++
++uint8_t PlayerInventory::customBarGroup() const {
++  return m_customBarGroup;
++}
++
++void PlayerInventory::setCustomBarGroup(uint8_t group) {
++  m_customBarGroup = group;
++}
++
++uint8_t PlayerInventory::customBarGroups() const {
++  return m_customBar.size(0);
++}
++
++uint8_t PlayerInventory::customBarIndexes() const {
++  return m_customBar.size(1);
++}
++
++SelectedActionBarLocation PlayerInventory::selectedActionBarLocation() const {
++  return m_selectedActionBar;
++}
++
++void PlayerInventory::selectActionBarLocation(SelectedActionBarLocation location) {
++  m_selectedActionBar = location;
++}
++
++ItemPtr PlayerInventory::primaryHeldItem() const {
++  if (m_swapSlot)
++    return m_swapSlot;
++
++  if (m_selectedActionBar.is<EssentialItem>())
++    return m_essential.value(m_selectedActionBar.get<EssentialItem>());
++
++  if (m_selectedActionBar.is<CustomBarIndex>()) {
++    if (auto slot = m_customBar.at(m_customBarGroup, m_selectedActionBar.get<CustomBarIndex>()).first)
++      return itemsAt(*slot);
++  }
++
++  return {};
++}
++
++ItemPtr PlayerInventory::secondaryHeldItem() const {
++  auto pri = primaryHeldItem();
++  if (itemSafeTwoHanded(pri) || m_swapSlot || !m_selectedActionBar || m_selectedActionBar.is<EssentialItem>())
++    return {};
++
++  auto const& cbl = m_customBar.at(m_customBarGroup, m_selectedActionBar.get<CustomBarIndex>());
++
++  if (cbl.first && itemSafeTwoHanded(itemsAt(*cbl.first)))
++    return {};
++
++  if (cbl.second)
++    return itemsAt(*cbl.second);
++
++  return {};
++}
++
++Maybe<InventorySlot> PlayerInventory::primaryHeldSlot() const {
++  if (m_swapSlot)
++    return InventorySlot(SwapSlot());
++  if (m_selectedActionBar.is<CustomBarIndex>())
++    return customBarPrimarySlot(m_selectedActionBar.get<CustomBarIndex>());
++  return {};
++}
++
++Maybe<InventorySlot> PlayerInventory::secondaryHeldSlot() const {
++  if (m_swapSlot || itemSafeTwoHanded(primaryHeldItem()))
++    return {};
++  if (m_selectedActionBar.is<CustomBarIndex>())
++    return customBarSecondarySlot(m_selectedActionBar.get<CustomBarIndex>());
++  return {};
++}
++
++List<ItemPtr> PlayerInventory::pullOverflow() {
++  return std::move(m_inventoryLoadOverflow);
++}
++
++bool PlayerInventory::equipmentVisibility(EquipmentSlot slot) const {
++  return (m_equipmentVisibilityMask >> (uint8_t)slot) & 0x1;
++}
++
++void PlayerInventory::setEquipmentVisibility(EquipmentSlot slot, bool visible) {
++  if (visible)
++    m_equipmentVisibilityMask |= (1 << (uint8_t)slot);
++  else
++    m_equipmentVisibilityMask &= ~(1 << (uint8_t)slot);
++}
++
++void PlayerInventory::load(Json const& store) {
++  auto itemDatabase = Root::singleton().itemDatabase();
++
++  for (auto slot : EquipmentSlotNames) {
++    auto jItem = store.get(strf("{}Slot", slot.second), Json());
++    m_equipment[slot.first] = itemDatabase->diskLoad(jItem);
++  }
++
++  //reuse ItemBags so the Inventory pane still works after load()'ing into the same PlayerInventory again (from swap)
++  auto itemBags = store.get("itemBags").toObject();
++  m_inventoryLoadOverflow.clear();
++  for (auto const& p : itemBags) {
++    auto& bagType = p.first;
++    auto newBag = ItemBag::loadStore(p.second);
++    if (m_bags.contains(bagType)) {
++      auto& bag = m_bags.at(bagType);
++      m_inventoryLoadOverflow.appendAll(newBag.resize(bag->size()));
++      *bag = std::move(newBag);
++    } else {
++      m_inventoryLoadOverflow.appendAll(newBag.items());
++    }
++  }
++
++  m_swapSlot = itemDatabase->diskLoad(store.get("swapSlot"));
++  m_trashSlot = itemDatabase->diskLoad(store.get("trashSlot"));
++
++  m_currencies = jsonToMapV<StringMap<uint64_t>>(store.get("currencies"), mem_fn(&Json::toUInt));
++
++  m_customBarGroup = store.getUInt("customBarGroup");
++
++  for (size_t i = 0; i < m_customBar.size(0); ++i) {
++    for (size_t j = 0; j < m_customBar.size(1); ++j) {
++      Json cbl = store.get("customBar").get(i, JsonArray()).get(j, JsonArray());
++      auto validateLink = [this](Maybe<InventorySlot> link) -> Maybe<InventorySlot> {
++        if (link && link->is<BagSlot>()) {
++          auto& slot = link->get<BagSlot>();
++          if (m_bags.contains(slot.first) && size_t(slot.second) < m_bags[slot.first]->size())
++            return link;
++          else
++            return {};
++        }
++        return link;
++      };
++      m_customBar.at(i, j) = CustomBarLink{
++        validateLink(jsonToMaybe<InventorySlot>(cbl.get(0, {}), jsonToInventorySlot)),
++        validateLink(jsonToMaybe<InventorySlot>(cbl.get(1, {}), jsonToInventorySlot))
++      };
++    }
++  }
++
++  m_selectedActionBar = jsonToSelectedActionBarLocation(store.get("selectedActionBar"));
++
++  m_essential.clear();
++  m_essential[EssentialItem::BeamAxe] = itemDatabase->diskLoad(store.get("beamAxe"));
++  m_essential[EssentialItem::WireTool] = itemDatabase->diskLoad(store.get("wireTool"));
++  m_essential[EssentialItem::PaintTool] = itemDatabase->diskLoad(store.get("paintTool"));
++  m_essential[EssentialItem::InspectionTool] = itemDatabase->diskLoad(store.get("inspectionTool"));
++
++  m_equipmentVisibilityMask = (unsigned)store.optUInt("equipmentVisibilityMask").value(0xFFFFFFFF);
++}
++
++Json PlayerInventory::store() const {
++  auto itemDatabase = Root::singleton().itemDatabase();
++
++  JsonArray customBar;
++  for (size_t i = 0; i < m_customBar.size(0); ++i) {
++    JsonArray customBarGroup;
++    for (size_t j = 0; j < m_customBar.size(1); ++j) {
++      auto const& cbl  = m_customBar.at(i, j);
++      customBarGroup.append(JsonArray{jsonFromMaybe(cbl.first, jsonFromInventorySlot), jsonFromMaybe(cbl.second, jsonFromInventorySlot)});
++    }
++    customBar.append(take(customBarGroup));
++  }
++
++  JsonObject itemBags;
++  for (auto& bag : m_bags)
++    itemBags.add(bag.first, bag.second->diskStore());
++
++  auto data = JsonObject{
++    {"itemBags", itemBags},
++    {"swapSlot", itemDatabase->diskStore(m_swapSlot)},
++    {"trashSlot", itemDatabase->diskStore(m_trashSlot)},
++    {"currencies", jsonFromMap(m_currencies)},
++    {"customBarGroup", m_customBarGroup},
++    {"customBar", std::move(customBar)},
++    {"selectedActionBar", jsonFromSelectedActionBarLocation(m_selectedActionBar)},
++    {"beamAxe", itemDatabase->diskStore(m_essential.value(EssentialItem::BeamAxe))},
++    {"wireTool", itemDatabase->diskStore(m_essential.value(EssentialItem::WireTool))},
++    {"paintTool", itemDatabase->diskStore(m_essential.value(EssentialItem::PaintTool))},
++    {"inspectionTool", itemDatabase->diskStore(m_essential.value(EssentialItem::InspectionTool))}
++  };
++
++  for (auto& equipment : m_equipment) {
++    if (equipment.first <= EquipmentSlot::BackCosmetic || equipment.second)
++      data.set(strf("{}Slot", EquipmentSlotNames.getRight(equipment.first)), itemDatabase->diskStore(equipment.second));
++  }
++
++  data.set("equipmentVisibilityMask", m_equipmentVisibilityMask);
++
++  return data;
++}
++
++void PlayerInventory::forEveryItem(function<void(InventorySlot const&, ItemPtr&)> function) {
++  auto checkedFunction = [function = std::move(function)](InventorySlot const& slot, ItemPtr& item) {
++    if (item)
++      function(slot, item);
++  };
++
++  for (auto& p : m_equipment)
++    checkedFunction(p.first, p.second);
++  for (auto const& p : m_bags) {
++    for (size_t i = 0; i < p.second->size(); ++i)
++      checkedFunction(BagSlot(p.first, i), p.second->at(i));
++  }
++  checkedFunction(SwapSlot(), m_swapSlot);
++  checkedFunction(TrashSlot(), m_trashSlot);
++}
++
++void PlayerInventory::forEveryItem(function<void(InventorySlot const&, ItemPtr const&)> function) const {
++  return const_cast<PlayerInventory*>(this)->forEveryItem([function = std::move(function)](InventorySlot const& slot, ItemPtr& item) {
++      function(slot, item);
++    });
++}
++
++List<ItemPtr> PlayerInventory::allItems() const {
++  List<ItemPtr> items;
++  forEveryItem([&items](InventorySlot const&, ItemPtr const& item) {
++      items.append(item);
++    });
++  return items;
++}
++
++Map<String, uint64_t> PlayerInventory::itemSummary() const {
++  Map<String, uint64_t> result;
++  forEveryItem([&result](auto const&, auto const& item) {
++      result[item->name()] += item->count();
++    });
++  return result;
++}
++
++void PlayerInventory::cleanup() {
++  for (auto pair : m_bags)
++    pair.second->cleanup();
++
++  for (auto& p : m_equipment)
++    if (p.second && p.second->empty())
++      p.second = ItemPtr();
++
++  if (m_swapSlot && m_swapSlot->empty())
++    m_swapSlot = ItemPtr();
++
++  if (m_trashSlot && m_trashSlot->empty())
++    m_trashSlot = ItemPtr();
++
++  m_customBar.forEach([this](Array2S const&, CustomBarLink& p) {
++      ItemPtr primary = p.first ? retrieve(*p.first) : ItemPtr();
++      ItemPtr secondary = p.second ? retrieve(*p.second) : ItemPtr();
++
++      // Reset the primary and secondary action bar link if the item is gone
++      if (!primary)
++        p.first.reset();
++      if (!secondary)
++        p.second.reset();
++
++      // If the primary hand item is two handed, the secondary hand should not be
++      // set
++      if (itemSafeTwoHanded(primary))
++        p.second.reset();
++      // Two handed items are not allowed in the secondary slot
++      if (itemSafeTwoHanded(secondary))
++        p.second.reset();
++    });
++}
++
++void PlayerInventory::setPlayer(Player* player) {
++  m_player = player;
++}
++
++PlayerInventory const& PlayerInventory::blankInventory() {
++  static thread_local auto inventory = std::make_shared<PlayerInventory>();
++  return *inventory;
++}
++
++void PlayerInventory::netStore(DataStream& ds, NetCompatibilityRules rules) const {
++  if (m_player && !m_player->isMaster() && !rules.isAdmin())
++    return blankInventory().netStore(ds, rules);
++  else
++    return NetElementSyncGroup::netStore(ds, rules);
++}
++
++
++bool PlayerInventory::writeNetDelta(DataStream& ds, uint64_t fromVersion, NetCompatibilityRules rules) const {
++  if (m_player && !m_player->isMaster() && !rules.isAdmin())
++    return blankInventory().writeNetDelta(ds, fromVersion, rules);
++  else
++    return NetElementSyncGroup::writeNetDelta(ds, fromVersion, rules);
++}
++
++bool PlayerInventory::checkInventoryFilter(ItemPtr const& items, String const& filterName) {
++  Json filterConfig;
++
++  auto itemFilters = items->instanceValue("inventoryFilters");
++  if (itemFilters.isType(Json::Type::Object)) {
++    filterConfig = itemFilters.opt(filterName).value();
++    if (!filterConfig.isType(Json::Type::Object))
++      filterConfig = itemFilters.opt("default").value();
++  }
++
++  if (!filterConfig.isType(Json::Type::Object)) {
++    auto config = Root::singleton().assets()->json("/player.config:inventoryFilters");
++    filterConfig = config.opt(filterName).value();
++    if (!filterConfig.isType(Json::Type::Object))
++      filterConfig = config.get("default", JsonObject());
++  }
++
++  // filter by item type if an itemTypes filter is set
++  auto itemDatabase = Root::singleton().itemDatabase();
++  auto itemTypeName = ItemTypeNames.getRight(itemDatabase->itemType(items->name()));
++  if (filterConfig.contains("typeWhitelist") && !filterConfig.getArray("typeWhitelist").contains(itemTypeName))
++    return false;
++
++  if (filterConfig.contains("typeBlacklist") && filterConfig.getArray("typeBlacklist").contains(itemTypeName))
++    return false;
++
++  // filter by item tags if an itemTags filter is set
++  // this is an inclusive filter
++  auto itemTags = itemDatabase->itemTags(items->name());
++  if (filterConfig.contains("tagWhitelist")) {
++    auto whitelistedTags = filterConfig.getArray("tagWhitelist").filtered([itemTags](Json const& tag) {
++        return itemTags.contains(tag.toString());
++      });
++    if (whitelistedTags.size() == 0)
++      return false;
++  }
++
++  if (filterConfig.contains("tagBlacklist")) {
++    auto blacklistedTags = filterConfig.getArray("tagBlacklist").filtered([itemTags](Json const& tag) {
++        return itemTags.contains(tag.toString());
++      });
++    if (blacklistedTags.size() > 0)
++      return false;
++  }
++
++  auto itemCategory = items->category();
++  if (auto categoryWhitelist = filterConfig.optArray("categoryWhitelist")) {
++    auto categoryWhiteset = jsonToStringSet(*categoryWhitelist);
++    if (!categoryWhiteset.contains(itemCategory))
++      return false;
++  }
++
++  if (auto categoryBlacklist = filterConfig.optArray("categoryBlacklist")) {
++    auto categoryBlackset = jsonToStringSet(*categoryBlacklist);
++    if (categoryBlackset.contains(itemCategory))
++      return false;
++  }
++
++  return true;
++}
++
++ItemPtr const& PlayerInventory::retrieve(InventorySlot const& slot) const {
++  return const_cast<PlayerInventory*>(this)->retrieve(slot);
++}
++
++ItemPtr& PlayerInventory::retrieve(InventorySlot const& slot) {
++  auto guardEmpty = [](ItemPtr& item) -> ItemPtr& {
++    if (item && item->empty())
++      item = {};
++    return item;
++  };
++
++  if (auto es = slot.ptr<EquipmentSlot>())
++    return guardEmpty(m_equipment[*es]);
++  else if (auto bs = slot.ptr<BagSlot>()) {
++    if (auto bag = m_bags.ptr(bs->first))
++      return guardEmpty((*bag)->at(bs->second));
++  } else if (slot.is<SwapSlot>())
++    return guardEmpty(m_swapSlot);
++  else
++    return guardEmpty(m_trashSlot);
++
++  throw ItemException::format("Invalid inventory slot {}", jsonFromInventorySlot(slot));
++}
++
++void PlayerInventory::swapCustomBarLinks(InventorySlot a, InventorySlot b) {
++  m_customBar.forEach([&](Array2S const&, CustomBarLink& p) {
++      if (p.first == a)
++        p.first = b;
++      else if (p.first == b)
++        p.first = a;
++
++      if (p.second == a)
++        p.second = b;
++      else if (p.second == b)
++        p.second = a;
++    });
++}
++
++void PlayerInventory::autoAddToCustomBar(InventorySlot slot) {
++  if (!Root::singleton().configuration()->getPath("inventory.pickupToActionBar").toBool())
++    return;
++
++  auto items = itemsAt(slot);
++  if (items && !items->empty() && checkInventoryFilter(items, "autoAddToCustomBar"))
++    addToCustomBar(slot);
++}
++
++void PlayerInventory::netElementsNeedLoad(bool) {
++  auto itemDatabase = Root::singleton().itemDatabase();
++
++  auto deserializeItem = [&itemDatabase](NetElementData<ItemDescriptor>& netState, ItemPtr& item) {
++    if (netState.pullUpdated())
++      itemDatabase->loadItem(netState.get(), item);
++  };
++
++  auto deserializeItemList = [&](List<NetElementData<ItemDescriptor>>& netStatesList, List<ItemPtr>& itemList) {
++    for (size_t i = 0; i < netStatesList.size(); ++i)
++      deserializeItem(netStatesList[i], itemList[i]);
++  };
++
++  auto deserializeItemMap = [&](auto& netStatesMap, auto& itemMap) {
++    for (auto k : netStatesMap.keys())
++      deserializeItem(netStatesMap[k], itemMap[k]);
++  };
++
++  deserializeItemMap(m_equipmentNetState, m_equipment);
++
++  for (auto bagType : m_bagsNetState.keys())
++    deserializeItemList(m_bagsNetState[bagType], m_bags[bagType]->items());
++
++  deserializeItem(m_swapSlotNetState, m_swapSlot);
++  deserializeItem(m_trashSlotNetState, m_trashSlot);
++
++  m_currencies = m_currenciesNetState.get();
++
++  m_customBarGroup = m_customBarGroupNetState.get();
++  m_customBarNetState.forEach([&](auto const& index, auto& ns) {
++      m_customBar.at(index) = ns.get();
++    });
++
++  m_selectedActionBar = m_selectedActionBarNetState.get();
++
++  deserializeItemMap(m_essentialNetState, m_essential);
++
++  cleanup();
++}
++
++void PlayerInventory::netElementsNeedStore() {
++  cleanup();
++
++  auto serializeItem = [](NetElementData<ItemDescriptor>& netState, ItemPtr& item) {
++    netState.set(itemSafeDescriptor(item));
++  };
++
++  auto serializeItemList = [&](List<NetElementData<ItemDescriptor>>& netStatesList, List<ItemPtr>& itemList) {
++    for (size_t i = 0; i < netStatesList.size(); ++i)
++      serializeItem(netStatesList[i], itemList[i]);
++  };
++
++  auto serializeItemMap = [&](auto& netStatesMap, auto& itemMap) {
++    for (auto k : netStatesMap.keys())
++      serializeItem(netStatesMap[k], itemMap[k]);
++  };
++
++  serializeItemMap(m_equipmentNetState, m_equipment);
++
++  for (auto bagType : m_bagsNetState.keys())
++    serializeItemList(m_bagsNetState[bagType], m_bags[bagType]->items());
++
++  serializeItem(m_swapSlotNetState, m_swapSlot);
++  serializeItem(m_trashSlotNetState, m_trashSlot);
++
++  m_currenciesNetState.set(m_currencies);
++
++  m_customBarGroupNetState.set(m_customBarGroup);
++  m_customBar.forEach([&](auto const& index, auto& cbl) {
++      m_customBarNetState.at(index).set(cbl);
++    });
++
++  m_selectedActionBarNetState.set(m_selectedActionBar);
++
++  serializeItemMap(m_essentialNetState, m_essential);
++}
++
++}
+diff --git a/source/game/StarPlayerInventory.hpp b/source/game/StarPlayerInventory.hpp
+index 9b93415..5dd8435 100644
+--- a/source/game/StarPlayerInventory.hpp
++++ b/source/game/StarPlayerInventory.hpp
+@@ -1,245 +1,251 @@
+-#pragma once
+-
+-#include "StarInventoryTypes.hpp"
+-#include "StarMultiArray.hpp"
+-#include "StarNetElementSystem.hpp"
+-#include "StarItemDescriptor.hpp"
+-
+-namespace Star {
+-
+-STAR_CLASS(Item);
+-STAR_CLASS(ItemBag);
+-STAR_CLASS(ArmorItem);
+-STAR_CLASS(HeadArmor);
+-STAR_CLASS(ChestArmor);
+-STAR_CLASS(LegsArmor);
+-STAR_CLASS(BackArmor);
+-STAR_CLASS(Player);
+-
+-STAR_CLASS(PlayerInventory);
+-
+-STAR_EXCEPTION(InventoryException, StarException);
+-
+-// Describes a player's entire inventory, including the main bag, material bag,
+-// object bag, reagent bag, food bag, weapon and armor slots, swap slot, trash
+-// slot, essential items, and currencies.
+-//
+-// Items in the inventory can be shorcutted in the "Action Bar", and one
+-// location in the action bar is selected at a time and the primary and
+-// secondary held items are the items pointed to in that action bar location.
+-//
+-// The special slot called the "swap" slot is used specifically for inventory
+-// management and is attached to the cursor.  When the swap slot is active,
+-// then whatever is in the slot swap temporarily becomes the only held item.
+-//
+-// The essential items are items that are not manageable and not pointable to
+-// by an ItemSlot, but are part of the action bar shortcut system.  They are
+-// used for permanent tools that need to be always quickly available.
+-//
+-// Currency items that enter the inventory are immediately put in the common currencies
+-// pool, and are also not manageable items.
+-class PlayerInventory : public NetElementSyncGroup {
+-public:
+-  // Whether the given item is allowed to go in the given slot type
+-  static bool itemAllowedInBag(ItemPtr const& item, String const& bagType);
+-  static bool itemAllowedAsEquipment(ItemPtr const& item, EquipmentSlot equipmentSlot);
+-
+-  PlayerInventory();
+-
+-  ItemPtr itemsAt(InventorySlot const& slot) const;
+-
+-  // Attempts to combine the items with the given slot, and returns the items
+-  // left over (if any).
+-  ItemPtr stackWith(InventorySlot const& slot, ItemPtr const& items);
+-
+-  // Empty the slot and take what it contains, if any.
+-  ItemPtr takeSlot(InventorySlot const& slot);
+-
+-  // Try to exchange items between any two slots, returns true on success.
+-  bool exchangeItems(InventorySlot const& first, InventorySlot const& second);
+-
+-  // Forces the given item into the given slot, overriding what was already
+-  // there.  If the item is not allowed in the given location, does nothing and
+-  // returns false.
+-  bool setItem(InventorySlot const& slot, ItemPtr const& item);
+-
+-  bool consumeSlot(InventorySlot const& slot, uint64_t count = 1);
+-
+-  bool slotValid(InventorySlot const& slot) const;
+-
+-  // Adds items to any slot except the trash or swap slots, returns stack left
+-  // over.
+-  ItemPtr addItems(ItemPtr items);
+-
+-  // Adds items to the first matching item bag, avoiding the equipment, swap,
+-  // or trash slots
+-  ItemPtr addToBags(ItemPtr items);
+-
+-  // Returns number of items in the given set that can fit anywhere in any item
+-  // slot except the trash slot (the number of items that would be added by a
+-  // call to addItems).
+-  uint64_t itemsCanFit(ItemPtr const& items) const;
+-
+-  bool hasItem(ItemDescriptor const& descriptor, bool exactMatch = false) const;
+-  uint64_t hasCountOfItem(ItemDescriptor const& descriptor, bool exactMatch = false) const;
+-
+-  // Consume items based on ItemDescriptor. Can take from any manageable item slot.
+-  bool consumeItems(ItemDescriptor const& descriptor, bool exactMatch = false);
+-  ItemDescriptor takeItems(ItemDescriptor const& descriptor, bool takePartial = false, bool exactMatch = false);
+-  // Return a summary of every item that can be consumed by ItemDescriptor.
+-  HashMap<ItemDescriptor, uint64_t> availableItems() const;
+-
+-  HeadArmorPtr headArmor() const;
+-  ChestArmorPtr chestArmor() const;
+-  LegsArmorPtr legsArmor() const;
+-  BackArmorPtr backArmor() const;
+-
+-  HeadArmorPtr headCosmetic() const;
+-  ChestArmorPtr chestCosmetic() const;
+-  LegsArmorPtr legsCosmetic() const;
+-  BackArmorPtr backCosmetic() const;
+-
+-  ArmorItemPtr equipment(EquipmentSlot slot, bool testMask = false) const;
+-
+-  ItemBagConstPtr bagContents(String const& bag) const;
+-
+-  void condenseBagStacks(String const& bag);
+-
+-  // Sorting a bag will not change the contents of an action bar location.  It
+-  // will instead potentially change the pointed to slot of an action bar
+-  // location to point to the new slot that contains the same item.
+-  void sortBag(String const& bag);
+-
+-  // Either move the contents of the given slot into the swap slot, move the
+-  // contents of the swap slot into the given inventory slot, or swap the
+-  // contents of the swap slot and the inventory slot, or combine them,
+-  // whichever makes the most sense.
+-  void shiftSwap(InventorySlot const& slot);
+-
+-  // Puts the swap slot back into the inventory, if there is room.  Returns
+-  // true if this was successful, and the swap slot is now empty.
+-  bool clearSwap();
+-
+-  ItemPtr swapSlotItem() const;
+-  void setSwapSlotItem(ItemPtr const& items);
+-
+-  // Non-manageable essential items that are always available as action bar
+-  // entries.
+-  ItemPtr essentialItem(EssentialItem essentialItem) const;
+-  void setEssentialItem(EssentialItem essentialItem, ItemPtr item);
+-
+-  // Non-manageable currencies
+-  StringMap<uint64_t> availableCurrencies() const;
+-  uint64_t currency(String const& currencyType) const;
+-  void addCurrency(String const& currencyType, uint64_t amount);
+-  bool consumeCurrency(String const& currencyType, uint64_t amount);
+-
+-  // A custom bar location primary and secondary cannot point to a slot that
+-  // has no item, and rather than set an empty slot to that location, the slot
+-  // will simply be cleared.  If a primary slot is set to a two handed item, it
+-  // will clear the secondary slot.  Any secondary slot that is set must be a
+-  // one handed item.
+-  Maybe<InventorySlot> customBarPrimarySlot(CustomBarIndex customBarIndex) const;
+-  Maybe<InventorySlot> customBarSecondarySlot(CustomBarIndex customBarIndex) const;
+-  void setCustomBarPrimarySlot(CustomBarIndex customBarIndex, Maybe<InventorySlot> slot);
+-  void setCustomBarSecondarySlot(CustomBarIndex customBarIndex, Maybe<InventorySlot> slot);
+-
+-  // Add the given slot to a free place in the custom bar if one is available.
+-  void addToCustomBar(InventorySlot slot);
+-
+-  // The custom bar has 'CustomBarGroups' groups that can be switched between.
+-  // This will not change the selected action bar location, but may change the
+-  // item if the selected location points to the custom bar and the contents
+-  // change.
+-  uint8_t customBarGroup() const;
+-  void setCustomBarGroup(uint8_t group);
+-  uint8_t customBarGroups() const;
+-  uint8_t customBarIndexes() const;
+-
+-  // The action bar is the combination of the custom bar and the essential
+-  // items, and any of these locations can be selected.
+-  SelectedActionBarLocation selectedActionBarLocation() const;
+-  void selectActionBarLocation(SelectedActionBarLocation selectedActionBarLocation);
+-
+-  // Held items are either the items shortcutted to in the currently selected
+-  // ActionBar primary / secondary locations, or if the swap slot is non-empty
+-  // then the swap slot.
+-  ItemPtr primaryHeldItem() const;
+-  ItemPtr secondaryHeldItem() const;
+-
+-  // If the primary / secondary held items are valid manageable slots, returns
+-  // them.
+-  Maybe<InventorySlot> primaryHeldSlot() const;
+-  Maybe<InventorySlot> secondaryHeldSlot() const;
+-
+-  List<ItemPtr> pullOverflow();
+-  void setEquipmentVisibility(EquipmentSlot slot, bool visible);
+-  bool equipmentVisibility(EquipmentSlot slot) const;
+-
+-  void load(Json const& store);
+-  Json store() const;
+-
+-  // Loop over every manageable item and potentially mutate it.
+-  void forEveryItem(function<void(InventorySlot const&, ItemPtr&)> function);
+-  // Loop over every manageable item.
+-  void forEveryItem(function<void(InventorySlot const&, ItemPtr const&)> function) const;
+-  // Return every manageable item
+-  List<ItemPtr> allItems() const;
+-  // Return summary of every manageable item name and the count of that item
+-  Map<String, uint64_t> itemSummary() const;
+-
+-  // Clears away any empty items and sets them as null, and updates action bar
+-  // slots to maintain the rules for the action bar.  Should be called every
+-  // tick.
+-  void cleanup();
+-
+-  // The given player pointer must be valid for the lifetime of this inventory
+-  void setPlayer(Player*);
+-
+-  static PlayerInventory const& blankInventory();
+-
+-  void netStore(DataStream& ds, NetCompatibilityRules rules = {}) const override;
+-  bool writeNetDelta(DataStream& ds, uint64_t fromVersion, NetCompatibilityRules rules = {}) const override;
+-
+-private:
+-  typedef pair<Maybe<InventorySlot>, Maybe<InventorySlot>> CustomBarLink;
+-
+-  static bool checkInventoryFilter(ItemPtr const& items, String const& filterName);
+-
+-  ItemPtr const& retrieve(InventorySlot const& slot) const;
+-  ItemPtr& retrieve(InventorySlot const& slot);
+-
+-  void swapCustomBarLinks(InventorySlot a, InventorySlot b);
+-  void autoAddToCustomBar(InventorySlot slot);
+-
+-  void netElementsNeedLoad(bool full) override;
+-  void netElementsNeedStore() override;
+-
+-  Map<EquipmentSlot, ItemPtr> m_equipment;
+-  Map<String, ItemBagPtr> m_bags;
+-  ItemPtr m_swapSlot;
+-  Maybe<InventorySlot> m_swapReturnSlot;
+-  ItemPtr m_trashSlot;
+-  Map<EssentialItem, ItemPtr> m_essential;
+-  StringMap<uint64_t> m_currencies;
+-  uint8_t m_customBarGroup;
+-  MultiArray<CustomBarLink, 2> m_customBar;
+-  SelectedActionBarLocation m_selectedActionBar;
+-
+-  Map<EquipmentSlot, NetElementData<ItemDescriptor>> m_equipmentNetState;
+-  Map<String, List<NetElementData<ItemDescriptor>>> m_bagsNetState;
+-  NetElementData<ItemDescriptor> m_swapSlotNetState;
+-  NetElementData<ItemDescriptor> m_trashSlotNetState;
+-  Map<EssentialItem, NetElementData<ItemDescriptor>> m_essentialNetState;
+-  NetElementData<StringMap<uint64_t>> m_currenciesNetState;
+-  NetElementUInt m_customBarGroupNetState;
+-  MultiArray<NetElementData<CustomBarLink>, 2> m_customBarNetState;
+-  NetElementData<SelectedActionBarLocation> m_selectedActionBarNetState;
+-
+-  List<ItemPtr> m_inventoryLoadOverflow;
+-  unsigned m_equipmentVisibilityMask;
+-
+-  Player* m_player;
+-};
+-
+-}
++#pragma once
++
++#include "StarInventoryTypes.hpp"
++#include "StarMultiArray.hpp"
++#include "StarNetElementSystem.hpp"
++#include "StarItemDescriptor.hpp"
++
++namespace Star {
++
++STAR_CLASS(Item);
++STAR_CLASS(ItemBag);
++STAR_CLASS(ArmorItem);
++STAR_CLASS(HeadArmor);
++STAR_CLASS(ChestArmor);
++STAR_CLASS(LegsArmor);
++STAR_CLASS(BackArmor);
++STAR_CLASS(Player);
++
++STAR_CLASS(PlayerInventory);
++
++STAR_EXCEPTION(InventoryException, StarException);
++
++// Describes a player's entire inventory, including the main bag, material bag,
++// object bag, reagent bag, food bag, weapon and armor slots, swap slot, trash
++// slot, essential items, and currencies.
++//
++// Items in the inventory can be shorcutted in the "Action Bar", and one
++// location in the action bar is selected at a time and the primary and
++// secondary held items are the items pointed to in that action bar location.
++//
++// The special slot called the "swap" slot is used specifically for inventory
++// management and is attached to the cursor.  When the swap slot is active,
++// then whatever is in the slot swap temporarily becomes the only held item.
++//
++// The essential items are items that are not manageable and not pointable to
++// by an ItemSlot, but are part of the action bar shortcut system.  They are
++// used for permanent tools that need to be always quickly available.
++//
++// Currency items that enter the inventory are immediately put in the common currencies
++// pool, and are also not manageable items.
++class PlayerInventory : public NetElementSyncGroup {
++public:
++  // Whether the given item is allowed to go in the given slot type
++  static bool itemAllowedInBag(ItemPtr const& item, String const& bagType);
++  static bool itemAllowedAsEquipment(ItemPtr const& item, EquipmentSlot equipmentSlot);
++
++  PlayerInventory();
++
++  ItemPtr itemsAt(InventorySlot const& slot) const;
++
++  // Attempts to combine the items with the given slot, and returns the items
++  // left over (if any).
++  ItemPtr stackWith(InventorySlot const& slot, ItemPtr const& items);
++
++  // Empty the slot and take what it contains, if any.
++  ItemPtr takeSlot(InventorySlot const& slot);
++
++  // Try to exchange items between any two slots, returns true on success.
++  bool exchangeItems(InventorySlot const& first, InventorySlot const& second);
++
++  // Forces the given item into the given slot, overriding what was already
++  // there.  If the item is not allowed in the given location, does nothing and
++  // returns false.
++  bool setItem(InventorySlot const& slot, ItemPtr const& item);
++
++  bool consumeSlot(InventorySlot const& slot, uint64_t count = 1);
++
++  bool slotValid(InventorySlot const& slot) const;
++
++  // Adds items to any slot except the trash or swap slots, returns stack left
++  // over.
++  ItemPtr addItems(ItemPtr items);
++
++  // Adds items to the first matching item bag, avoiding the equipment, swap,
++  // or trash slots
++  ItemPtr addToBags(ItemPtr items);
++
++  // Returns number of items in the given set that can fit anywhere in any item
++  // slot except the trash slot (the number of items that would be added by a
++  // call to addItems).
++  uint64_t itemsCanFit(ItemPtr const& items) const;
++
++  // When includeVirtual is true, items provided by the player's virtual
++  // inventory scripts (see Player::virtualInventoryCount) are included.
++  bool hasItem(ItemDescriptor const& descriptor, bool exactMatch = false, bool includeVirtual = true) const;
++  uint64_t hasCountOfItem(ItemDescriptor const& descriptor, bool exactMatch = false, bool includeVirtual = true) const;
++
++  // Consume items based on ItemDescriptor. Can take from any manageable item
++  // slot, and then from the virtual inventory if includeVirtual is true.
++  bool consumeItems(ItemDescriptor const& descriptor, bool exactMatch = false, bool includeVirtual = true);
++  ItemDescriptor takeItems(ItemDescriptor const& descriptor, bool takePartial = false, bool exactMatch = false, bool includeVirtual = true);
++  // Return a summary of every item that can be consumed by ItemDescriptor.
++  HashMap<ItemDescriptor, uint64_t> availableItems(bool includeVirtual = true) const;
++
++  HeadArmorPtr headArmor() const;
++  ChestArmorPtr chestArmor() const;
++  LegsArmorPtr legsArmor() const;
++  BackArmorPtr backArmor() const;
++
++  HeadArmorPtr headCosmetic() const;
++  ChestArmorPtr chestCosmetic() const;
++  LegsArmorPtr legsCosmetic() const;
++  BackArmorPtr backCosmetic() const;
++
++  ArmorItemPtr equipment(EquipmentSlot slot, bool testMask = false) const;
++
++  ItemBagConstPtr bagContents(String const& bag) const;
++
++  void condenseBagStacks(String const& bag);
++
++  // Sorting a bag will not change the contents of an action bar location.  It
++  // will instead potentially change the pointed to slot of an action bar
++  // location to point to the new slot that contains the same item.
++  void sortBag(String const& bag);
++
++  // Either move the contents of the given slot into the swap slot, move the
++  // contents of the swap slot into the given inventory slot, or swap the
++  // contents of the swap slot and the inventory slot, or combine them,
++  // whichever makes the most sense.
++  void shiftSwap(InventorySlot const& slot);
++
++  // Puts the swap slot back into the inventory, if there is room.  Returns
++  // true if this was successful, and the swap slot is now empty.
++  bool clearSwap();
++
++  ItemPtr swapSlotItem() const;
++  void setSwapSlotItem(ItemPtr const& items);
++
++  // Non-manageable essential items that are always available as action bar
++  // entries.
++  ItemPtr essentialItem(EssentialItem essentialItem) const;
++  void setEssentialItem(EssentialItem essentialItem, ItemPtr item);
++
++  // Non-manageable currencies
++  StringMap<uint64_t> availableCurrencies() const;
++  uint64_t currency(String const& currencyType) const;
++  void addCurrency(String const& currencyType, uint64_t amount);
++  bool consumeCurrency(String const& currencyType, uint64_t amount);
++
++  // A custom bar location primary and secondary cannot point to a slot that
++  // has no item, and rather than set an empty slot to that location, the slot
++  // will simply be cleared.  If a primary slot is set to a two handed item, it
++  // will clear the secondary slot.  Any secondary slot that is set must be a
++  // one handed item.
++  Maybe<InventorySlot> customBarPrimarySlot(CustomBarIndex customBarIndex) const;
++  Maybe<InventorySlot> customBarSecondarySlot(CustomBarIndex customBarIndex) const;
++  void setCustomBarPrimarySlot(CustomBarIndex customBarIndex, Maybe<InventorySlot> slot);
++  void setCustomBarSecondarySlot(CustomBarIndex customBarIndex, Maybe<InventorySlot> slot);
++
++  // Add the given slot to a free place in the custom bar if one is available.
++  void addToCustomBar(InventorySlot slot);
++
++  // The custom bar has 'CustomBarGroups' groups that can be switched between.
++  // This will not change the selected action bar location, but may change the
++  // item if the selected location points to the custom bar and the contents
++  // change.
++  uint8_t customBarGroup() const;
++  void setCustomBarGroup(uint8_t group);
++  uint8_t customBarGroups() const;
++  uint8_t customBarIndexes() const;
++
++  // The action bar is the combination of the custom bar and the essential
++  // items, and any of these locations can be selected.
++  SelectedActionBarLocation selectedActionBarLocation() const;
++  void selectActionBarLocation(SelectedActionBarLocation selectedActionBarLocation);
++
++  // Held items are either the items shortcutted to in the currently selected
++  // ActionBar primary / secondary locations, or if the swap slot is non-empty
++  // then the swap slot.
++  ItemPtr primaryHeldItem() const;
++  ItemPtr secondaryHeldItem() const;
++
++  // If the primary / secondary held items are valid manageable slots, returns
++  // them.
++  Maybe<InventorySlot> primaryHeldSlot() const;
++  Maybe<InventorySlot> secondaryHeldSlot() const;
++
++  List<ItemPtr> pullOverflow();
++  void setEquipmentVisibility(EquipmentSlot slot, bool visible);
++  bool equipmentVisibility(EquipmentSlot slot) const;
++
++  void load(Json const& store);
++  Json store() const;
++
++  // Loop over every manageable item and potentially mutate it.
++  void forEveryItem(function<void(InventorySlot const&, ItemPtr&)> function);
++  // Loop over every manageable item.
++  void forEveryItem(function<void(InventorySlot const&, ItemPtr const&)> function) const;
++  // Return every manageable item
++  List<ItemPtr> allItems() const;
++  // Return summary of every manageable item name and the count of that item
++  Map<String, uint64_t> itemSummary() const;
++
++  // Clears away any empty items and sets them as null, and updates action bar
++  // slots to maintain the rules for the action bar.  Should be called every
++  // tick.
++  void cleanup();
++
++  // The given player pointer must be valid for the lifetime of this inventory
++  void setPlayer(Player*);
++
++  static PlayerInventory const& blankInventory();
++
++  void netStore(DataStream& ds, NetCompatibilityRules rules = {}) const override;
++  bool writeNetDelta(DataStream& ds, uint64_t fromVersion, NetCompatibilityRules rules = {}) const override;
++
++private:
++  typedef pair<Maybe<InventorySlot>, Maybe<InventorySlot>> CustomBarLink;
++
++  static bool checkInventoryFilter(ItemPtr const& items, String const& filterName);
++
++  ItemPtr const& retrieve(InventorySlot const& slot) const;
++  ItemPtr& retrieve(InventorySlot const& slot);
++
++  // Consumes only from real item slots, the descriptor count must be available.
++  bool consumeRealItems(ItemDescriptor const& descriptor, bool exactMatch);
++
++  void swapCustomBarLinks(InventorySlot a, InventorySlot b);
++  void autoAddToCustomBar(InventorySlot slot);
++
++  void netElementsNeedLoad(bool full) override;
++  void netElementsNeedStore() override;
++
++  Map<EquipmentSlot, ItemPtr> m_equipment;
++  Map<String, ItemBagPtr> m_bags;
++  ItemPtr m_swapSlot;
++  Maybe<InventorySlot> m_swapReturnSlot;
++  ItemPtr m_trashSlot;
++  Map<EssentialItem, ItemPtr> m_essential;
++  StringMap<uint64_t> m_currencies;
++  uint8_t m_customBarGroup;
++  MultiArray<CustomBarLink, 2> m_customBar;
++  SelectedActionBarLocation m_selectedActionBar;
++
++  Map<EquipmentSlot, NetElementData<ItemDescriptor>> m_equipmentNetState;
++  Map<String, List<NetElementData<ItemDescriptor>>> m_bagsNetState;
++  NetElementData<ItemDescriptor> m_swapSlotNetState;
++  NetElementData<ItemDescriptor> m_trashSlotNetState;
++  Map<EssentialItem, NetElementData<ItemDescriptor>> m_essentialNetState;
++  NetElementData<StringMap<uint64_t>> m_currenciesNetState;
++  NetElementUInt m_customBarGroupNetState;
++  MultiArray<NetElementData<CustomBarLink>, 2> m_customBarNetState;
++  NetElementData<SelectedActionBarLocation> m_selectedActionBarNetState;
++
++  List<ItemPtr> m_inventoryLoadOverflow;
++  unsigned m_equipmentVisibilityMask;
++
++  Player* m_player;
++};
++
++}
+diff --git a/source/game/scripting/StarPlayerLuaBindings.cpp b/source/game/scripting/StarPlayerLuaBindings.cpp
+index aaa5deb..e5c9855 100755
+--- a/source/game/scripting/StarPlayerLuaBindings.cpp
++++ b/source/game/scripting/StarPlayerLuaBindings.cpp
+@@ -352,8 +352,11 @@ LuaCallbacks LuaBindings::makePlayerCallbacks(Player* player) {
+       player->inventory()->cleanup();
+     });
+ 
+-  callbacks.registerCallback("giveItem", [player](Json const& item) {
+-      player->giveItem(ItemDescriptor(item));
++  callbacks.registerCallback("giveItem", [player](Json const& item, Maybe<bool> allowIntercept) {
++      if (allowIntercept.value(false))
++        player->giveItem(ItemDescriptor(item));
++      else
++        player->giveItemWithoutIntercept(ItemDescriptor(item));
+     });
+ 
+   callbacks.registerCallback("giveEssentialItem", [player](String const& slotName, Json const& item) {
+@@ -396,16 +399,20 @@ LuaCallbacks LuaBindings::makePlayerCallbacks(Player* player) {
+     return false;
+   });
+ 
+-  callbacks.registerCallback("hasItem", [player](Json const& item, Maybe<bool> exactMatch) {
+-      return player->hasItem(ItemDescriptor(item), exactMatch.value(false));
++  callbacks.registerCallback("hasItem", [player](Json const& item, Maybe<bool> exactMatch, Maybe<bool> includeVirtual) {
++      return player->hasItem(ItemDescriptor(item), exactMatch.value(false), includeVirtual.value(true));
++    });
++
++  callbacks.registerCallback("hasCountOfItem", [player](Json const& item, Maybe<bool> exactMatch, Maybe<bool> includeVirtual) {
++      return player->hasCountOfItem(ItemDescriptor(item), exactMatch.value(false), includeVirtual.value(true));
+     });
+ 
+-  callbacks.registerCallback("hasCountOfItem", [player](Json const& item, Maybe<bool> exactMatch) {
+-      return player->hasCountOfItem(ItemDescriptor(item), exactMatch.value(false));
++  callbacks.registerCallback("consumeItem", [player](Json const& item, Maybe<bool> consumePartial, Maybe<bool> exactMatch, Maybe<bool> includeVirtual) {
++      return player->takeItem(ItemDescriptor(item), consumePartial.value(false), exactMatch.value(false), includeVirtual.value(true)).toJson();
+     });
+ 
+-  callbacks.registerCallback("consumeItem", [player](Json const& item, Maybe<bool> consumePartial, Maybe<bool> exactMatch) {
+-      return player->takeItem(ItemDescriptor(item), consumePartial.value(false), exactMatch.value(false)).toJson();
++  callbacks.registerCallback("virtualInventorySupported", []() {
++      return true;
+     });
+ 
+   callbacks.registerCallback("inventoryTags", [player]() {
+diff --git a/source/windowing/StarListWidget.cpp b/source/windowing/StarListWidget.cpp
+index bb8161b..6f28233 100644
+--- a/source/windowing/StarListWidget.cpp
++++ b/source/windowing/StarListWidget.cpp
+@@ -160,12 +160,19 @@ void ListWidget::setSelected(size_t pos) {
+       bgWidget->setImage(m_unselectedBG);
+   }
+ 
++  if (pos != NPos && pos >= listSize())
++    pos = NPos;
++
+   if (!m_disabledItems.contains(pos) && m_selectedItem != pos) {
+     m_selectedItem = pos;
+     if (m_callback)
+       m_callback(this);
+   }
+ 
++  // The callback may have changed the list contents.
++  if (m_selectedItem != NPos && m_selectedItem >= listSize())
++    m_selectedItem = NPos;
++
+   if (m_selectedItem != NPos) {
+     if (auto bgWidget = selectedWidget()->fetchChild<ImageWidget>("background"))
+       bgWidget->setImage(m_selectedBG);
+diff --git a/source/windowing/StarPaneManager.cpp b/source/windowing/StarPaneManager.cpp
+index 1c7e628..c3d8c53 100644
+--- a/source/windowing/StarPaneManager.cpp
++++ b/source/windowing/StarPaneManager.cpp
+@@ -1,440 +1,440 @@
+-#include "StarPaneManager.hpp"
+-#include "StarGameTypes.hpp"
+-#include "StarJsonExtra.hpp"
+-#include "StarAssets.hpp"
+-#include "StarRoot.hpp"
+-
+-namespace Star {
+-
+-EnumMap<PaneLayer> const PaneLayerNames{
+-  {PaneLayer::Tooltip, "Tooltip"},
+-  {PaneLayer::ModalWindow, "ModalWindow"},
+-  {PaneLayer::Window, "Window"},
+-  {PaneLayer::Hud, "Hud"},
+-  {PaneLayer::World, "World"}
+-};
+-
+-PaneManager::PaneManager()
+-  : m_context(GuiContext::singletonPtr()), m_prevInterfaceScale(1) {
+-  auto assets = Root::singleton().assets();
+-  m_tooltipMouseoverRadius = assets->json("/panes.config:tooltipMouseoverRadius").toFloat();
+-  m_tooltipMouseOffset = jsonToVec2I(assets->json("/panes.config:tooltipMouseoverOffset"));
+-  m_tooltipShowTimer = GameTimer(assets->json("/panes.config:tooltipMouseoverTime").toFloat());
+-}
+-
+-void PaneManager::displayPane(PaneLayer paneLayer, PanePtr const& pane, DismissCallback onDismiss) {
+-  if (!m_displayedPanes[paneLayer].insertFront(pane, std::move(onDismiss)).second)
+-    throw GuiException("Pane displayed twice in PaneManager::displayPane");
+-
+-  if (!pane->hasDisplayed() && pane->anchor() == PaneAnchor::None)
+-    pane->setPosition(Vec2I((windowSize() - pane->size()) / 2) + pane->centerOffset()); // center it
+-
+-  pane->displayed();
+-}
+-
+-bool PaneManager::isDisplayed(PanePtr const& pane) const {
+-  for (auto const& layerPair : m_displayedPanes) {
+-    if (layerPair.second.contains(pane))
+-      return true;
+-  }
+-
+-  return false;
+-}
+-
+-void PaneManager::dismissPane(PanePtr const& pane) {
+-  if (!dismiss(pane))
+-    throw GuiException("No such pane in PaneManager::dismissPane");
+-}
+-
+-void PaneManager::dismissAllPanes(Set<PaneLayer> const& paneLayers) {
+-  for (auto const& paneLayer : paneLayers) {
+-    for (auto const& panePair : copy(m_displayedPanes[paneLayer]))
+-      dismiss(panePair.first);
+-  }
+-}
+-
+-void PaneManager::dismissAllPanes() {
+-  for (auto layerPair : copy(m_displayedPanes)) {
+-    for (auto const& panePair : layerPair.second)
+-      dismiss(panePair.first);
+-  }
+-}
+-
+-PanePtr PaneManager::topPane(Set<PaneLayer> const& paneLayers) const {
+-  for (auto const& layerPair : m_displayedPanes) {
+-    if (paneLayers.contains(layerPair.first) && !layerPair.second.empty())
+-      return layerPair.second.firstKey();
+-  }
+-  return {};
+-}
+-
+-PanePtr PaneManager::topPane() const {
+-  for (auto const& layerPair : m_displayedPanes) {
+-    if (!layerPair.second.empty())
+-      return layerPair.second.firstKey();
+-  }
+-  return {};
+-}
+-
+-void PaneManager::bringToTop(PanePtr const& pane) {
+-  for (auto& layerPair : m_displayedPanes) {
+-    if (layerPair.second.contains(pane)) {
+-      layerPair.second.toFront(pane);
+-      return;
+-    }
+-  }
+-
+-  throw GuiException("Pane was not displayed in PaneManager::bringToTop");
+-}
+-
+-void PaneManager::bringPaneAdjacent(PanePtr const& anchor, PanePtr const& adjacent, int gap) {
+-  Vec2I centerAdjacent = anchor->position() + (anchor->size() / 2) - (adjacent->size() / 2);
+-  centerAdjacent = centerAdjacent.piecewiseClamp(Vec2I(), windowSize() - adjacent->size()); // keeps pane inside window
+-
+-  if (anchor->position()[0] + anchor->size()[0] + gap + adjacent->size()[0] <= windowSize()[0])
+-    adjacent->setPosition(Vec2I(anchor->position()[0] + anchor->size()[0] + gap, centerAdjacent[1])); // place to the right
+-  else if (anchor->position()[0] - gap - adjacent->size()[0] >= 0)
+-    adjacent->setPosition(Vec2I(anchor->position()[0] - gap - adjacent->size()[0], centerAdjacent[1])); // place to the left
+-  else if (anchor->position()[1] + anchor->size()[1] + gap + adjacent->size()[1] <= windowSize()[1])
+-    adjacent->setPosition(Vec2I(centerAdjacent[0], anchor->position()[1] + anchor->size()[1] + gap)); // place above
+-  else if (anchor->position()[1] - gap - adjacent->size()[1] >= 0)
+-    adjacent->setPosition(Vec2I(centerAdjacent[0], anchor->position()[1] - gap - adjacent->size()[1])); // place below
+-  else
+-    adjacent->setPosition(centerAdjacent);
+-
+-  bringToTop(adjacent);
+-}
+-
+-PanePtr PaneManager::getPaneAt(Set<PaneLayer> const& paneLayers, Vec2I const& position) const {
+-  for (auto const& layerPair : m_displayedPanes) {
+-    if (!paneLayers.contains(layerPair.first))
+-      continue;
+-
+-    for (auto const& panePair : layerPair.second) {
+-      if (panePair.first->inWindow(position) && panePair.first->active())
+-        return panePair.first;
+-    }
+-  }
+-
+-  return {};
+-}
+-
+-PanePtr PaneManager::getPaneAt(Vec2I const& position) const {
+-  for (auto const& layerPair : m_displayedPanes) {
+-    for (auto const& panePair : layerPair.second) {
+-      if (panePair.first != m_activeTooltip
+-        && panePair.first->inWindow(position)
+-        && panePair.first->active())
+-        return panePair.first;
+-    }
+-  }
+-
+-  return {};
+-}
+-
+-List<PanePtr> PaneManager::getAllPanes() {
+-  List<PanePtr> list;
+-  for (auto const& layerPair : m_displayedPanes) {
+-    for (auto const& panePair : layerPair.second) {
+-      if (panePair.first != m_activeTooltip && panePair.first->active())
+-        list.append(panePair.first);
+-    }
+-  }
+-  return list;
+-}
+-
+-void PaneManager::setBackgroundWidget(WidgetPtr bg) {
+-  m_backgroundWidget = bg;
+-}
+-
+-void PaneManager::dismissWhere(function<bool(PanePtr const&)> func) {
+-  if (!func)
+-    return;
+-
+-  for (auto& layerPair : m_displayedPanes) {
+-    eraseWhere(layerPair.second, [&](auto& panePair) {
+-      if (func(panePair.first)) {
+-        panePair.first->dismissed();
+-        if (panePair.second)
+-          panePair.second(panePair.first);
+-        return true;
+-      }
+-      return false;
+-    });
+-  }
+-}
+-
+-PanePtr PaneManager::keyboardCapturedPane() const {
+-  for (auto const& layerPair : m_displayedPanes) {
+-    for (auto const& panePair : layerPair.second) {
+-      if (panePair.first->keyboardCapturer())
+-        return panePair.first;
+-    }
+-  }
+-
+-  return {};
+-}
+-
+-WidgetPtr PaneManager::keyboardCapturedWidget() const {
+-  for (auto const& layerPair : m_displayedPanes) {
+-    for (auto const& panePair : layerPair.second) {
+-      if (auto capturer = panePair.first->keyboardCapturer())
+-        return capturer;
+-    }
+-  }
+-
+-  return {};
+-}
+-
+-bool PaneManager::keyboardCapturedForTextInput() const {
+-  if (auto widget = keyboardCapturedWidget())
+-    return widget->keyboardCaptureMode() == KeyboardCaptureMode::TextInput;
+-  return false;
+-}
+-
+-bool PaneManager::sendInputEvent(InputEvent const& event) {
+-  if (event.is<MouseMoveEvent>()) {
+-    m_tooltipLastMousePos = *m_context->mousePosition(event);
+-
+-    for (auto const& layerPair : m_displayedPanes) {
+-      for (auto const& panePair : layerPair.second) {
+-        if (panePair.first->dragActive()) {
+-          panePair.first->drag(*m_context->mousePosition(event));
+-          return true;
+-        }
+-      }
+-    }
+-  }
+-
+-  if (event.is<MouseButtonDownEvent>()) {
+-    m_tooltipShowTimer.reset();
+-    if (m_activeTooltip) {
+-      dismiss(m_activeTooltip);
+-      m_activeTooltip.reset();
+-      m_tooltipParentPane.reset();
+-      m_tooltipShowTimer.reset();
+-    }
+-  }
+-
+-  if (event.is<MouseButtonUpEvent>()) {
+-    for (auto const& layerPair : m_displayedPanes) {
+-      for (auto const& panePair : layerPair.second) {
+-        if (panePair.first->dragActive()) {
+-          panePair.first->setDragActive(false, {});
+-          return true;
+-        }
+-      }
+-    }
+-  }
+-
+-  // The gui close event can only be intercepted by a pane that has captured
+-  // the keyboard otherwise it will always be used to close first before being
+-  // a normal event. This is so a window can control its own closing if it
+-  // really needs to (like the keybindings window).
+-  if (event.is<KeyDownEvent>() && m_context->actions(event).contains(InterfaceAction::GuiClose)) {
+-    if (auto top = topPane({PaneLayer::ModalWindow, PaneLayer::Window})) {
+-      dismiss(top);
+-      return true;
+-    }
+-  }
+-
+-  // If there is a pane that has captured the keyboard, keyboard events will
+-  // ONLY be sent to it.
+-  auto keyCapturePane = keyboardCapturedPane();
+-  if (keyCapturePane && (event.is<KeyDownEvent>() || event.is<KeyUpEvent>() || event.is<TextInputEvent>()))
+-    return keyCapturePane->sendEvent(event);
+-
+-  bool foundModal = false;
+-  for (auto& layerPair : m_displayedPanes) {
+-    for (auto const& panePair : copy(layerPair.second)) {
+-      if (panePair.first->sendEvent(event)) {
+-        if (event.is<MouseButtonDownEvent>())
+-          layerPair.second.toFront(panePair.first);
+-        return true;
+-      }
+-      // If any modal windows are shown, Only the first modal window should
+-      // have a chance to consume the input event and all other panes below it
+-      // including different layers should ignore it.
+-      if (layerPair.first == PaneLayer::ModalWindow) {
+-        foundModal = true;
+-        break;
+-      }
+-    }
+-    if (foundModal)
+-      break;
+-  }
+-
+-  return false;
+-}
+-
+-void PaneManager::render() {
+-  if (m_backgroundWidget) {
+-    auto size = m_backgroundWidget->size();
+-    m_backgroundWidget->setPosition(Vec2I((windowSize()[0] - size[0]) / 2, (windowSize()[1] - size[1]) / 2));
+-    m_backgroundWidget->render(RectI(Vec2I(), windowSize()));
+-  }
+-
+-  for (auto const& layerPair : reverseIterate(m_displayedPanes)) {
+-    for (auto const& panePair : reverseIterate(layerPair.second)) {
+-      if (panePair.first->active()) {
+-        if (m_prevInterfaceScale != m_context->interfaceScale())
+-          panePair.first->setPosition(
+-              calculateNewInterfacePosition(panePair.first, (float)m_context->interfaceScale() / m_prevInterfaceScale));
+-
+-        panePair.first->setDrawingOffset(calculatePaneOffset(panePair.first));
+-        panePair.first->render(RectI(Vec2I(), windowSize()));
+-      }
+-    }
+-  }
+-
+-  m_context->resetInterfaceScissorRect();
+-  m_prevInterfaceScale = m_context->interfaceScale();
+-}
+-
+-void PaneManager::update(float dt) {
+-  auto newTooltipParentPane = getPaneAt(m_tooltipLastMousePos);
+-
+-  bool updateTooltip = m_tooltipShowTimer.tick(dt) || (m_activeTooltip && (
+-    vmag(m_tooltipInitialPosition - m_tooltipLastMousePos) > m_tooltipMouseoverRadius
+-    || m_tooltipParentPane != newTooltipParentPane
+-    || !m_tooltipParentPane->inWindow(m_tooltipLastMousePos))); 
+-
+-  if (updateTooltip) {
+-    if (m_activeTooltip) {
+-      dismiss(m_activeTooltip);
+-      m_activeTooltip.reset();
+-      m_tooltipParentPane.reset();
+-    }
+-
+-    m_tooltipShowTimer.reset();
+-    if (newTooltipParentPane) {
+-      if (auto tooltip = newTooltipParentPane->createTooltip(m_tooltipLastMousePos)) {
+-        m_activeTooltip = std::move(tooltip);
+-        m_tooltipParentPane = std::move(newTooltipParentPane);
+-        m_tooltipInitialPosition = m_tooltipLastMousePos;
+-        displayPane(PaneLayer::Tooltip, m_activeTooltip);
+-      }
+-    }
+-  }
+-
+-  if (m_activeTooltip) {
+-    Vec2I offsetDirection = Vec2I::filled(1);
+-    Vec2I offsetAdjust = Vec2I();
+-
+-    if (m_tooltipLastMousePos[0] + m_tooltipMouseOffset[0] + m_activeTooltip->size()[0] > (int)m_context->windowWidth() / m_context->interfaceScale()) {
+-      offsetDirection[0] = -1;
+-      offsetAdjust[0] = -m_activeTooltip->size()[0];
+-    }
+-
+-    if (m_tooltipLastMousePos[1] + m_tooltipMouseOffset[1] - m_activeTooltip->size()[1] < 0)
+-      offsetDirection[1] = -1;
+-    else
+-      offsetAdjust[1] = -m_activeTooltip->size()[1];
+-
+-    m_activeTooltip->setPosition(m_tooltipLastMousePos + (offsetAdjust + m_tooltipMouseOffset.piecewiseMultiply(offsetDirection)));
+-  }
+-
+-  for (auto const& layerPair : m_displayedPanes) {
+-    for (auto const& panePair : copy(layerPair.second)) {
+-      if (panePair.first->isDismissed())
+-        dismiss(panePair.first);
+-    }
+-  }
+-
+-  for (auto const& layerPair : reverseIterate(m_displayedPanes)) {
+-    for (auto const& panePair : reverseIterate(layerPair.second)) {
+-      panePair.first->tick(dt);
+-      if (panePair.first->active())
+-        panePair.first->update(dt);
+-    }
+-  }
+-}
+-
+-Vec2I PaneManager::windowSize() const {
+-  return Vec2I(m_context->windowInterfaceSize());
+-}
+-
+-Vec2I PaneManager::calculatePaneOffset(PanePtr const& pane) const {
+-  Vec2I size = pane->size();
+-  switch (pane->anchor()) {
+-    case PaneAnchor::None:
+-      return pane->anchorOffset();
+-    case PaneAnchor::BottomLeft:
+-      return pane->anchorOffset();
+-    case PaneAnchor::BottomRight:
+-      return pane->anchorOffset() + Vec2I{windowSize()[0] - size[0], 0};
+-    case PaneAnchor::TopLeft:
+-      return pane->anchorOffset() + Vec2I{0, windowSize()[1] - size[1]};
+-    case PaneAnchor::TopRight:
+-      return pane->anchorOffset() + (windowSize() - size);
+-    case PaneAnchor::CenterTop:
+-      return pane->anchorOffset() + Vec2I{(windowSize()[0] - size[0]) / 2, windowSize()[1] - size[1]};
+-    case PaneAnchor::CenterBottom:
+-      return pane->anchorOffset() + Vec2I{(windowSize()[0] - size[0]) / 2, 0};
+-    case PaneAnchor::CenterLeft:
+-      return pane->anchorOffset() + Vec2I{0, (windowSize()[1] - size[1]) / 2};
+-    case PaneAnchor::CenterRight:
+-      return pane->anchorOffset() + Vec2I{windowSize()[0] - size[0], (windowSize()[1] - size[1]) / 2};
+-    case PaneAnchor::Center:
+-      return pane->anchorOffset() + ((windowSize() - size) / 2);
+-    default:
+-      return pane->anchorOffset();
+-  }
+-}
+-
+-Vec2I PaneManager::calculateNewInterfacePosition(PanePtr const& pane, float interfaceScaleRatio) const {
+-  Vec2F position(pane->relativePosition());
+-  Vec2F size(pane->size());
+-  Mat3F scale;
+-  switch (pane->anchor()) {
+-    case PaneAnchor::None:
+-      scale = Mat3F::scaling(interfaceScaleRatio, Vec2F(windowSize()) / 2);
+-      break;
+-    case PaneAnchor::BottomLeft:
+-      scale = Mat3F::scaling(interfaceScaleRatio);
+-      break;
+-    case PaneAnchor::BottomRight:
+-      scale = Mat3F::scaling(interfaceScaleRatio, {size[0], 0});
+-      break;
+-    case PaneAnchor::TopLeft:
+-      scale = Mat3F::scaling(interfaceScaleRatio, {0, size[1]});
+-      break;
+-    case PaneAnchor::TopRight:
+-      scale = Mat3F::scaling(interfaceScaleRatio, size);
+-      break;
+-    case PaneAnchor::CenterTop:
+-      scale = Mat3F::scaling(interfaceScaleRatio, {size[0] / 2, size[1]});
+-      break;
+-    case PaneAnchor::CenterBottom:
+-      scale = Mat3F::scaling(interfaceScaleRatio, {size[0] / 2, 0});
+-      break;
+-    case PaneAnchor::CenterLeft:
+-      scale = Mat3F::scaling(interfaceScaleRatio, {0, size[1] / 2});
+-      break;
+-    case PaneAnchor::CenterRight:
+-      scale = Mat3F::scaling(interfaceScaleRatio, {size[0], size[1] / 2});
+-      break;
+-    case PaneAnchor::Center:
+-      scale = Mat3F::scaling(interfaceScaleRatio, size / 2);
+-      break;
+-    default:
+-      scale = Mat3F::scaling(interfaceScaleRatio, Vec2F(windowSize()) / 2);
+-  }
+-  return Vec2I::round((scale * Vec3F(position, 0)).vec2());
+-}
+-
+-bool PaneManager::dismiss(PanePtr const& pane) {
+-  bool dismissed = false;
+-  for (auto& layerPair : m_displayedPanes) {
+-    if (auto panePair = layerPair.second.maybeTake(pane)) {
+-      dismissed = true;
+-      panePair->first->dismissed();
+-      if (panePair->second)
+-        panePair->second(pane);
+-    }
+-  }
+-
+-  return dismissed;
+-}
+-
+-}
++#include "StarPaneManager.hpp"
++#include "StarGameTypes.hpp"
++#include "StarJsonExtra.hpp"
++#include "StarAssets.hpp"
++#include "StarRoot.hpp"
++
++namespace Star {
++
++EnumMap<PaneLayer> const PaneLayerNames{
++  {PaneLayer::Tooltip, "Tooltip"},
++  {PaneLayer::ModalWindow, "ModalWindow"},
++  {PaneLayer::Window, "Window"},
++  {PaneLayer::Hud, "Hud"},
++  {PaneLayer::World, "World"}
++};
++
++PaneManager::PaneManager()
++  : m_context(GuiContext::singletonPtr()), m_prevInterfaceScale(1) {
++  auto assets = Root::singleton().assets();
++  m_tooltipMouseoverRadius = assets->json("/panes.config:tooltipMouseoverRadius").toFloat();
++  m_tooltipMouseOffset = jsonToVec2I(assets->json("/panes.config:tooltipMouseoverOffset"));
++  m_tooltipShowTimer = GameTimer(assets->json("/panes.config:tooltipMouseoverTime").toFloat());
++}
++
++void PaneManager::displayPane(PaneLayer paneLayer, PanePtr const& pane, DismissCallback onDismiss) {
++  if (!m_displayedPanes[paneLayer].insertFront(pane, std::move(onDismiss)).second)
++    throw GuiException("Pane displayed twice in PaneManager::displayPane");
++
++  if (!pane->hasDisplayed() && pane->anchor() == PaneAnchor::None)
++    pane->setPosition(Vec2I((windowSize() - pane->size()) / 2) + pane->centerOffset()); // center it
++
++  pane->displayed();
++}
++
++bool PaneManager::isDisplayed(PanePtr const& pane) const {
++  for (auto const& layerPair : m_displayedPanes) {
++    if (layerPair.second.contains(pane))
++      return true;
++  }
++
++  return false;
++}
++
++void PaneManager::dismissPane(PanePtr const& pane) {
++  if (!dismiss(pane))
++    throw GuiException("No such pane in PaneManager::dismissPane");
++}
++
++void PaneManager::dismissAllPanes(Set<PaneLayer> const& paneLayers) {
++  for (auto const& paneLayer : paneLayers) {
++    for (auto const& panePair : copy(m_displayedPanes[paneLayer]))
++      dismiss(panePair.first);
++  }
++}
++
++void PaneManager::dismissAllPanes() {
++  for (auto layerPair : copy(m_displayedPanes)) {
++    for (auto const& panePair : layerPair.second)
++      dismiss(panePair.first);
++  }
++}
++
++PanePtr PaneManager::topPane(Set<PaneLayer> const& paneLayers) const {
++  for (auto const& layerPair : m_displayedPanes) {
++    if (paneLayers.contains(layerPair.first) && !layerPair.second.empty())
++      return layerPair.second.firstKey();
++  }
++  return {};
++}
++
++PanePtr PaneManager::topPane() const {
++  for (auto const& layerPair : m_displayedPanes) {
++    if (!layerPair.second.empty())
++      return layerPair.second.firstKey();
++  }
++  return {};
++}
++
++void PaneManager::bringToTop(PanePtr const& pane) {
++  for (auto& layerPair : m_displayedPanes) {
++    if (layerPair.second.contains(pane)) {
++      layerPair.second.toFront(pane);
++      return;
++    }
++  }
++
++  throw GuiException("Pane was not displayed in PaneManager::bringToTop");
++}
++
++void PaneManager::bringPaneAdjacent(PanePtr const& anchor, PanePtr const& adjacent, int gap) {
++  Vec2I centerAdjacent = anchor->position() + (anchor->size() / 2) - (adjacent->size() / 2);
++  centerAdjacent = centerAdjacent.piecewiseClamp(Vec2I(), windowSize() - adjacent->size()); // keeps pane inside window
++
++  if (anchor->position()[0] + anchor->size()[0] + gap + adjacent->size()[0] <= windowSize()[0])
++    adjacent->setPosition(Vec2I(anchor->position()[0] + anchor->size()[0] + gap, centerAdjacent[1])); // place to the right
++  else if (anchor->position()[0] - gap - adjacent->size()[0] >= 0)
++    adjacent->setPosition(Vec2I(anchor->position()[0] - gap - adjacent->size()[0], centerAdjacent[1])); // place to the left
++  else if (anchor->position()[1] + anchor->size()[1] + gap + adjacent->size()[1] <= windowSize()[1])
++    adjacent->setPosition(Vec2I(centerAdjacent[0], anchor->position()[1] + anchor->size()[1] + gap)); // place above
++  else if (anchor->position()[1] - gap - adjacent->size()[1] >= 0)
++    adjacent->setPosition(Vec2I(centerAdjacent[0], anchor->position()[1] - gap - adjacent->size()[1])); // place below
++  else
++    adjacent->setPosition(centerAdjacent);
++
++  bringToTop(adjacent);
++}
++
++PanePtr PaneManager::getPaneAt(Set<PaneLayer> const& paneLayers, Vec2I const& position) const {
++  for (auto const& layerPair : m_displayedPanes) {
++    if (!paneLayers.contains(layerPair.first))
++      continue;
++
++    for (auto const& panePair : layerPair.second) {
++      if (panePair.first->inWindow(position) && panePair.first->active())
++        return panePair.first;
++    }
++  }
++
++  return {};
++}
++
++PanePtr PaneManager::getPaneAt(Vec2I const& position) const {
++  for (auto const& layerPair : m_displayedPanes) {
++    for (auto const& panePair : layerPair.second) {
++      if (panePair.first != m_activeTooltip
++        && panePair.first->inWindow(position)
++        && panePair.first->active())
++        return panePair.first;
++    }
++  }
++
++  return {};
++}
++
++List<PanePtr> PaneManager::getAllPanes() {
++  List<PanePtr> list;
++  for (auto const& layerPair : m_displayedPanes) {
++    for (auto const& panePair : layerPair.second) {
++      if (panePair.first != m_activeTooltip && panePair.first->active())
++        list.append(panePair.first);
++    }
++  }
++  return list;
++}
++
++void PaneManager::setBackgroundWidget(WidgetPtr bg) {
++  m_backgroundWidget = bg;
++}
++
++void PaneManager::dismissWhere(function<bool(PanePtr const&)> func) {
++  if (!func)
++    return;
++
++  for (auto& layerPair : m_displayedPanes) {
++    eraseWhere(layerPair.second, [&](auto& panePair) {
++      if (func(panePair.first)) {
++        panePair.first->dismissed();
++        if (panePair.second)
++          panePair.second(panePair.first);
++        return true;
++      }
++      return false;
++    });
++  }
++}
++
++PanePtr PaneManager::keyboardCapturedPane() const {
++  for (auto const& layerPair : m_displayedPanes) {
++    for (auto const& panePair : layerPair.second) {
++      if (panePair.first->keyboardCapturer())
++        return panePair.first;
++    }
++  }
++
++  return {};
++}
++
++WidgetPtr PaneManager::keyboardCapturedWidget() const {
++  for (auto const& layerPair : m_displayedPanes) {
++    for (auto const& panePair : layerPair.second) {
++      if (auto capturer = panePair.first->keyboardCapturer())
++        return capturer;
++    }
++  }
++
++  return {};
++}
++
++bool PaneManager::keyboardCapturedForTextInput() const {
++  if (auto widget = keyboardCapturedWidget())
++    return widget->keyboardCaptureMode() == KeyboardCaptureMode::TextInput;
++  return false;
++}
++
++bool PaneManager::sendInputEvent(InputEvent const& event) {
++  if (event.is<MouseMoveEvent>()) {
++    m_tooltipLastMousePos = *m_context->mousePosition(event);
++
++    for (auto const& layerPair : m_displayedPanes) {
++      for (auto const& panePair : layerPair.second) {
++        if (panePair.first->dragActive()) {
++          panePair.first->drag(*m_context->mousePosition(event));
++          return true;
++        }
++      }
++    }
++  }
++
++  if (event.is<MouseButtonDownEvent>()) {
++    m_tooltipShowTimer.reset();
++    if (m_activeTooltip) {
++      dismiss(m_activeTooltip);
++      m_activeTooltip.reset();
++      m_tooltipParentPane.reset();
++      m_tooltipShowTimer.reset();
++    }
++  }
++
++  if (event.is<MouseButtonUpEvent>()) {
++    for (auto const& layerPair : m_displayedPanes) {
++      for (auto const& panePair : layerPair.second) {
++        if (panePair.first->dragActive()) {
++          panePair.first->setDragActive(false, {});
++          return true;
++        }
++      }
++    }
++  }
++
++  // The gui close event can only be intercepted by a pane that has captured
++  // the keyboard otherwise it will always be used to close first before being
++  // a normal event. This is so a window can control its own closing if it
++  // really needs to (like the keybindings window).
++  if (event.is<KeyDownEvent>() && m_context->actions(event).contains(InterfaceAction::GuiClose)) {
++    if (auto top = topPane({PaneLayer::ModalWindow, PaneLayer::Window})) {
++      dismiss(top);
++      return true;
++    }
++  }
++
++  // If there is a pane that has captured the keyboard, keyboard events will
++  // ONLY be sent to it.
++  auto keyCapturePane = keyboardCapturedPane();
++  if (keyCapturePane && (event.is<KeyDownEvent>() || event.is<KeyUpEvent>() || event.is<TextInputEvent>()))
++    return keyCapturePane->sendEvent(event);
++
++  bool foundModal = false;
++  for (auto& layerPair : m_displayedPanes) {
++    for (auto const& panePair : copy(layerPair.second)) {
++      if (panePair.first->sendEvent(event)) {
++        if (event.is<MouseButtonDownEvent>())
++          layerPair.second.toFront(panePair.first);
++        return true;
++      }
++      // If any modal windows are shown, Only the first modal window should
++      // have a chance to consume the input event and all other panes below it
++      // including different layers should ignore it.
++      if (layerPair.first == PaneLayer::ModalWindow) {
++        foundModal = true;
++        break;
++      }
++    }
++    if (foundModal)
++      break;
++  }
++
++  return false;
++}
++
++void PaneManager::render() {
++  if (m_backgroundWidget) {
++    auto size = m_backgroundWidget->size();
++    m_backgroundWidget->setPosition(Vec2I((windowSize()[0] - size[0]) / 2, (windowSize()[1] - size[1]) / 2));
++    m_backgroundWidget->render(RectI(Vec2I(), windowSize()));
++  }
++
++  for (auto const& layerPair : reverseIterate(m_displayedPanes)) {
++    for (auto const& panePair : reverseIterate(layerPair.second)) {
++      if (panePair.first->active()) {
++        if (m_prevInterfaceScale != m_context->interfaceScale())
++          panePair.first->setPosition(
++              calculateNewInterfacePosition(panePair.first, (float)m_context->interfaceScale() / m_prevInterfaceScale));
++
++        panePair.first->setDrawingOffset(calculatePaneOffset(panePair.first));
++        panePair.first->render(RectI(Vec2I(), windowSize()));
++      }
++    }
++  }
++
++  m_context->resetInterfaceScissorRect();
++  m_prevInterfaceScale = m_context->interfaceScale();
++}
++
++void PaneManager::update(float dt) {
++  auto newTooltipParentPane = getPaneAt(m_tooltipLastMousePos);
++
++  bool updateTooltip = m_tooltipShowTimer.tick(dt) || (m_activeTooltip && (
++    vmag(m_tooltipInitialPosition - m_tooltipLastMousePos) > m_tooltipMouseoverRadius
++    || m_tooltipParentPane != newTooltipParentPane
++    || !m_tooltipParentPane->inWindow(m_tooltipLastMousePos))); 
++
++  if (updateTooltip) {
++    if (m_activeTooltip) {
++      dismiss(m_activeTooltip);
++      m_activeTooltip.reset();
++      m_tooltipParentPane.reset();
++    }
++
++    m_tooltipShowTimer.reset();
++    if (newTooltipParentPane) {
++      if (auto tooltip = newTooltipParentPane->createTooltip(m_tooltipLastMousePos)) {
++        m_activeTooltip = std::move(tooltip);
++        m_tooltipParentPane = std::move(newTooltipParentPane);
++        m_tooltipInitialPosition = m_tooltipLastMousePos;
++        displayPane(PaneLayer::Tooltip, m_activeTooltip);
++      }
++    }
++  }
++
++  if (m_activeTooltip) {
++    Vec2I offsetDirection = Vec2I::filled(1);
++    Vec2I offsetAdjust = Vec2I();
++
++    if (m_tooltipLastMousePos[0] + m_tooltipMouseOffset[0] + m_activeTooltip->size()[0] > (int)m_context->windowWidth() / m_context->interfaceScale()) {
++      offsetDirection[0] = -1;
++      offsetAdjust[0] = -m_activeTooltip->size()[0];
++    }
++
++    if (m_tooltipLastMousePos[1] + m_tooltipMouseOffset[1] - m_activeTooltip->size()[1] < 0)
++      offsetDirection[1] = -1;
++    else
++      offsetAdjust[1] = -m_activeTooltip->size()[1];
++
++    m_activeTooltip->setPosition(m_tooltipLastMousePos + (offsetAdjust + m_tooltipMouseOffset.piecewiseMultiply(offsetDirection)));
++  }
++
++  for (auto const& layerPair : m_displayedPanes) {
++    for (auto const& panePair : copy(layerPair.second)) {
++      if (panePair.first->isDismissed())
++        dismiss(panePair.first);
++    }
++  }
++
++  for (auto const& layerPair : reverseIterate(m_displayedPanes)) {
++    for (auto const& panePair : reverseIterate(layerPair.second)) {
++      panePair.first->tick(dt);
++      if (panePair.first->active())
++        panePair.first->update(dt);
++    }
++  }
++}
++
++Vec2I PaneManager::windowSize() const {
++  return Vec2I(m_context->windowInterfaceSize());
++}
++
++Vec2I PaneManager::calculatePaneOffset(PanePtr const& pane) const {
++  Vec2I size = pane->size();
++  switch (pane->anchor()) {
++    case PaneAnchor::None:
++      return pane->anchorOffset();
++    case PaneAnchor::BottomLeft:
++      return pane->anchorOffset();
++    case PaneAnchor::BottomRight:
++      return pane->anchorOffset() + Vec2I{windowSize()[0] - size[0], 0};
++    case PaneAnchor::TopLeft:
++      return pane->anchorOffset() + Vec2I{0, windowSize()[1] - size[1]};
++    case PaneAnchor::TopRight:
++      return pane->anchorOffset() + (windowSize() - size);
++    case PaneAnchor::CenterTop:
++      return pane->anchorOffset() + Vec2I{(windowSize()[0] - size[0]) / 2, windowSize()[1] - size[1]};
++    case PaneAnchor::CenterBottom:
++      return pane->anchorOffset() + Vec2I{(windowSize()[0] - size[0]) / 2, 0};
++    case PaneAnchor::CenterLeft:
++      return pane->anchorOffset() + Vec2I{0, (windowSize()[1] - size[1]) / 2};
++    case PaneAnchor::CenterRight:
++      return pane->anchorOffset() + Vec2I{windowSize()[0] - size[0], (windowSize()[1] - size[1]) / 2};
++    case PaneAnchor::Center:
++      return pane->anchorOffset() + ((windowSize() - size) / 2);
++    default:
++      return pane->anchorOffset();
++  }
++}
++
++Vec2I PaneManager::calculateNewInterfacePosition(PanePtr const& pane, float interfaceScaleRatio) const {
++  Vec2F position(pane->relativePosition());
++  Vec2F size(pane->size());
++  Mat3F scale;
++  switch (pane->anchor()) {
++    case PaneAnchor::None:
++      scale = Mat3F::scaling(interfaceScaleRatio, Vec2F(windowSize()) / 2);
++      break;
++    case PaneAnchor::BottomLeft:
++      scale = Mat3F::scaling(interfaceScaleRatio);
++      break;
++    case PaneAnchor::BottomRight:
++      scale = Mat3F::scaling(interfaceScaleRatio, {size[0], 0});
++      break;
++    case PaneAnchor::TopLeft:
++      scale = Mat3F::scaling(interfaceScaleRatio, {0, size[1]});
++      break;
++    case PaneAnchor::TopRight:
++      scale = Mat3F::scaling(interfaceScaleRatio, size);
++      break;
++    case PaneAnchor::CenterTop:
++      scale = Mat3F::scaling(interfaceScaleRatio, {size[0] / 2, size[1]});
++      break;
++    case PaneAnchor::CenterBottom:
++      scale = Mat3F::scaling(interfaceScaleRatio, {size[0] / 2, 0});
++      break;
++    case PaneAnchor::CenterLeft:
++      scale = Mat3F::scaling(interfaceScaleRatio, {0, size[1] / 2});
++      break;
++    case PaneAnchor::CenterRight:
++      scale = Mat3F::scaling(interfaceScaleRatio, {size[0], size[1] / 2});
++      break;
++    case PaneAnchor::Center:
++      scale = Mat3F::scaling(interfaceScaleRatio, size / 2);
++      break;
++    default:
++      scale = Mat3F::scaling(interfaceScaleRatio, Vec2F(windowSize()) / 2);
++  }
++  return Vec2I::round((scale * Vec3F(position, 0)).vec2());
++}
++
++bool PaneManager::dismiss(PanePtr const& pane) {
++  bool dismissed = false;
++  for (auto& layerPair : m_displayedPanes) {
++    if (auto panePair = layerPair.second.maybeTake(pane)) {
++      dismissed = true;
++      panePair->first->dismissed();
++      if (panePair->second)
++        panePair->second(pane);
++    }
++  }
++
++  return dismissed;
++}
++
++}
+diff --git a/source/windowing/StarPaneManager.hpp b/source/windowing/StarPaneManager.hpp
+index cd90752..b61d626 100644
+--- a/source/windowing/StarPaneManager.hpp
++++ b/source/windowing/StarPaneManager.hpp
+@@ -1,107 +1,107 @@
+-#pragma once
+-
+-#include "StarPane.hpp"
+-#include "StarOrderedMap.hpp"
+-#include "StarBiMap.hpp"
+-#include "StarGameTimers.hpp"
+-
+-namespace Star {
+-
+-STAR_CLASS(PaneManager);
+-
+-enum class PaneLayer {
+-  // A special class of window only meant to be used by PaneManager to display
+-  // tooltips given by Pane::createTooltip
+-  Tooltip,
+-  // A special class of window that is displayed above all other windows and
+-  // turns off input to other windows and the hud until it is dismissed.
+-  ModalWindow,
+-  // Window layer for regular windows that are regularly displayed and
+-  // dismissed and dragged around.
+-  Window,
+-  // The bottom GUI layer, for persistent hud elements that are always or almost
+-  // always shown.  Not key dismissable.
+-  Hud,
+-  // Layer for interface elements which are logically part of the world but
+-  // handled by GUI panes (such as wires)
+-  World
+-};
+-extern EnumMap<PaneLayer> const PaneLayerNames;
+-
+-
+-// This class handles a set of panes to be drawn as a collective windowing
+-// interface.  It is a set of panes on separate distinct layers, where each
+-// layer contains a z-ordered list of panes to display.
+-class PaneManager {
+-public:
+-  typedef function<void(PanePtr const&)> DismissCallback;
+-
+-  PaneManager();
+-
+-  // Display a pane on any given layer.  The pane lifetime in this class is
+-  // only during display, once dismissed, the pane is forgotten completely.
+-  void displayPane(PaneLayer paneLayer, PanePtr const& pane, DismissCallback onDismiss = {});
+-
+-  bool isDisplayed(PanePtr const& pane) const;
+-
+-  // Dismiss a given displayed pane.  Pane must already be displayed.
+-  void dismissPane(PanePtr const& pane);
+-
+-  // Dismisses all panes in the given layers.
+-  void dismissAllPanes(Set<PaneLayer> const& paneLayers);
+-  void dismissAllPanes();
+-
+-  PanePtr topPane(Set<PaneLayer> const& paneLayers) const;
+-  PanePtr topPane() const;
+-
+-  // Brign an already displayed pane to the top of its layer.
+-  void bringToTop(PanePtr const& pane);
+-
+-  // Position a pane adjacent to an anchor pane in a direction where
+-  // it will fit on the screen
+-  void bringPaneAdjacent(PanePtr const& anchor, PanePtr const& adjacent, int gap);
+-
+-  PanePtr getPaneAt(Set<PaneLayer> const& paneLayers, Vec2I const& position) const;
+-  PanePtr getPaneAt(Vec2I const& position) const;
+-  List<PanePtr> getAllPanes();
+-
+-  void setBackgroundWidget(WidgetPtr bg);
+-
+-  void dismissWhere(function<bool(PanePtr const&)> func);
+-
+-  // Returns the pane/widget that has captured the keyboard, if any.
+-  PanePtr keyboardCapturedPane() const;
+-  WidgetPtr keyboardCapturedWidget() const;
+-  // Returns true if the current widget that has captured the keyboard is
+-  // accepting text input.
+-  bool keyboardCapturedForTextInput() const;
+-
+-  bool sendInputEvent(InputEvent const& event);
+-
+-  void render();
+-  void update(float dt);
+-
+-private:
+-  Vec2I windowSize() const;
+-  Vec2I calculatePaneOffset(PanePtr const& pane) const;
+-  Vec2I calculateNewInterfacePosition(PanePtr const& pane, float interfaceScaleRatio) const;
+-  bool dismiss(PanePtr const& pane);
+-
+-  GuiContext* m_context;
+-  float m_prevInterfaceScale;
+-
+-  // Map of each pane layer, where the 0th pane is the topmost pane in each layer.
+-  Map<PaneLayer, OrderedMap<PanePtr, DismissCallback>> m_displayedPanes;
+-
+-  WidgetPtr m_backgroundWidget;
+-
+-  float m_tooltipMouseoverRadius;
+-  Vec2I m_tooltipMouseOffset;
+-  GameTimer m_tooltipShowTimer;
+-  Vec2I m_tooltipLastMousePos;
+-  Vec2I m_tooltipInitialPosition;
+-  PanePtr m_activeTooltip;
+-  PanePtr m_tooltipParentPane;
+-};
+-
+-}
++#pragma once
++
++#include "StarPane.hpp"
++#include "StarOrderedMap.hpp"
++#include "StarBiMap.hpp"
++#include "StarGameTimers.hpp"
++
++namespace Star {
++
++STAR_CLASS(PaneManager);
++
++enum class PaneLayer {
++  // A special class of window only meant to be used by PaneManager to display
++  // tooltips given by Pane::createTooltip
++  Tooltip,
++  // A special class of window that is displayed above all other windows and
++  // turns off input to other windows and the hud until it is dismissed.
++  ModalWindow,
++  // Window layer for regular windows that are regularly displayed and
++  // dismissed and dragged around.
++  Window,
++  // The bottom GUI layer, for persistent hud elements that are always or almost
++  // always shown.  Not key dismissable.
++  Hud,
++  // Layer for interface elements which are logically part of the world but
++  // handled by GUI panes (such as wires)
++  World
++};
++extern EnumMap<PaneLayer> const PaneLayerNames;
++
++
++// This class handles a set of panes to be drawn as a collective windowing
++// interface.  It is a set of panes on separate distinct layers, where each
++// layer contains a z-ordered list of panes to display.
++class PaneManager {
++public:
++  typedef function<void(PanePtr const&)> DismissCallback;
++
++  PaneManager();
++
++  // Display a pane on any given layer.  The pane lifetime in this class is
++  // only during display, once dismissed, the pane is forgotten completely.
++  void displayPane(PaneLayer paneLayer, PanePtr const& pane, DismissCallback onDismiss = {});
++
++  bool isDisplayed(PanePtr const& pane) const;
++
++  // Dismiss a given displayed pane.  Pane must already be displayed.
++  void dismissPane(PanePtr const& pane);
++
++  // Dismisses all panes in the given layers.
++  void dismissAllPanes(Set<PaneLayer> const& paneLayers);
++  void dismissAllPanes();
++
++  PanePtr topPane(Set<PaneLayer> const& paneLayers) const;
++  PanePtr topPane() const;
++
++  // Brign an already displayed pane to the top of its layer.
++  void bringToTop(PanePtr const& pane);
++
++  // Position a pane adjacent to an anchor pane in a direction where
++  // it will fit on the screen
++  void bringPaneAdjacent(PanePtr const& anchor, PanePtr const& adjacent, int gap);
++
++  PanePtr getPaneAt(Set<PaneLayer> const& paneLayers, Vec2I const& position) const;
++  PanePtr getPaneAt(Vec2I const& position) const;
++  List<PanePtr> getAllPanes();
++
++  void setBackgroundWidget(WidgetPtr bg);
++
++  void dismissWhere(function<bool(PanePtr const&)> func);
++
++  // Returns the pane/widget that has captured the keyboard, if any.
++  PanePtr keyboardCapturedPane() const;
++  WidgetPtr keyboardCapturedWidget() const;
++  // Returns true if the current widget that has captured the keyboard is
++  // accepting text input.
++  bool keyboardCapturedForTextInput() const;
++
++  bool sendInputEvent(InputEvent const& event);
++
++  void render();
++  void update(float dt);
++
++private:
++  Vec2I windowSize() const;
++  Vec2I calculatePaneOffset(PanePtr const& pane) const;
++  Vec2I calculateNewInterfacePosition(PanePtr const& pane, float interfaceScaleRatio) const;
++  bool dismiss(PanePtr const& pane);
++
++  GuiContext* m_context;
++  float m_prevInterfaceScale;
++
++  // Map of each pane layer, where the 0th pane is the topmost pane in each layer.
++  Map<PaneLayer, OrderedMap<PanePtr, DismissCallback>> m_displayedPanes;
++
++  WidgetPtr m_backgroundWidget;
++
++  float m_tooltipMouseoverRadius;
++  Vec2I m_tooltipMouseOffset;
++  GameTimer m_tooltipShowTimer;
++  Vec2I m_tooltipLastMousePos;
++  Vec2I m_tooltipInitialPosition;
++  PanePtr m_activeTooltip;
++  PanePtr m_tooltipParentPane;
++};
++
++}
